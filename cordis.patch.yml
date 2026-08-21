@@ -1,0 +1,4 @@
+# dsh-plugin-subagent-delete bundle layer: mount the host plugin row.
+- insert:
+    - id: dsh-plugin-subagent-delete
+      name: dsh-plugin-subagent-delete
