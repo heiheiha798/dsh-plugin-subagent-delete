@@ -19,6 +19,8 @@ HTTP 路由。
 
 ```sh
 dsh plugin --profile web add github:heiheiha798/dsh-plugin-subagent-delete
+# 或固定到已发布版本
+dsh plugin --profile web add github:heiheiha798/dsh-plugin-subagent-delete#v0.2.0
 # 或从本地目录安装
 dsh plugin --profile web add /path/to/dsh-plugin-subagent-delete
 ```
