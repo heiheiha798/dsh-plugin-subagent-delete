@@ -19,6 +19,8 @@ with an ownership-checked, model-callable tool plus optional HTTP routes.
 
 ```sh
 dsh plugin --profile web add github:heiheiha798/dsh-plugin-subagent-delete
+# or pin to the published release
+dsh plugin --profile web add github:heiheiha798/dsh-plugin-subagent-delete#v0.2.0
 # or from a local checkout
 dsh plugin --profile web add /path/to/dsh-plugin-subagent-delete
 ```
