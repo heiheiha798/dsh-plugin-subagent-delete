@@ -70,6 +70,24 @@ Stops the current turn and releases a resident continuable Activation via
 `ctx.subagents.drainContinuableChildren`, but keeps the durable transcript.
 The subagent remains resumable with `send_message`.
 
+## Web UI auto-refresh
+
+DSH has an official refresh path for subagent creation (`session/created` →
+`host/session-added`) but no symmetric contract for deletion: for a durable
+subagent, `host/session-removed` is treated by the client as a status change
+(`running: false`) only, so the sidebar list and subagent catalog are not
+refreshed.
+
+This plugin works around that gap without patching DSH: after every permanent
+delete the host publishes a short-lived marker session through the official
+`prepare → enter → announce → detach` lifecycle seam, and the bundled web
+client component (`lib/client.js`) watches the public `sessions.list` snapshot.
+When the marker child is removed it debounces (350ms) and calls
+`sessions.refresh()` plus `sessions.refreshSubagents(parentId)` for the
+affected parents. Open web clients therefore update the subagent count
+immediately — no manual page reload required. The marker's `_no-cwd` artifact
+is swept after detach, so the refresh glue leaves no residue.
+
 ## HTTP routes (web profiles)
 
 For client integration and local debugging the host plugin registers:
@@ -93,8 +111,9 @@ same ownership check runs on every mutation.
 ## Development
 
 ```sh
-npm test       # node --test
-npm run check  # syntax check + tests
+npm test        # node --test
+npm run check   # syntax check + tests
+npm run pack:dry
 ```
 
 The test suite includes unit tests and an integration fixture created from ten
