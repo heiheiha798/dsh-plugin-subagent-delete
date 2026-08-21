@@ -1,15 +1,16 @@
 {
   "name": "dsh-plugin-subagent-delete",
-  "version": "0.1.0",
-  "description": "DeepSeek Harness plugin: delete_subagent / release_subagent / list_subagents tools plus host routes that permanently remove subagent sessions and take them out of the web UI list.",
+  "version": "0.2.0",
+  "description": "DeepSeek Harness plugin: ownership-checked delete_subagent / release_subagent / list_subagents tools and host routes that permanently remove subagent sessions from the web UI list.",
   "type": "module",
   "license": "MIT",
   "keywords": [
     "dsh-plugin",
     "deepseek-harness",
     "subagent",
-    "delete",
-    "cleanup"
+    "delete-subagent",
+    "cleanup",
+    "session-management"
   ],
   "repository": {
     "type": "git",
@@ -17,13 +18,18 @@
   },
   "files": [
     "src/",
+    "lib/client.js",
     "cordis.patch.yml",
     "README.md",
+    "README.zh.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
     "LICENSE"
   ],
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",
+    "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
   "engines": {
@@ -32,13 +38,33 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": "^0.1.0-rc.8"
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.8 <0.2.0-0"
   },
   "scripts": {
     "test": "node --test",
-    "check": "node --check src/index.js && node --test"
-  }
+    "check": "node --check src/index.js && node --test",
+    "pack:dry": "npm pack --dry-run",
+    "prepublishOnly": "npm run check"
+  },
+  "homepage": "https://github.com/heiheiha798/dsh-plugin-subagent-delete#readme",
+  "bugs": {
+    "url": "https://github.com/heiheiha798/dsh-plugin-subagent-delete/issues"
+  },
+  "author": "heiheiha798",
+  "publishConfig": {
+    "access": "public"
+  },
+  "packageManager": "pnpm@11.22.0",
+  "sideEffects": false,
+  "types": "src/index.d.ts"
 }

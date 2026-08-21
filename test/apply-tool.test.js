@@ -15,6 +15,24 @@ function makeCtx(home) {
   const workspaceRows = new Map()
   const globalState = { archivedSessionIds: [], initialized: true, workspaceIds: [] }
 
+  const markerCalls = []
+  const sessions = {
+    store: { get: () => undefined },
+    get: () => undefined,
+    flush: async () => false,
+    prepare(id, options) {
+      markerCalls.push(['prepare', id, options])
+      return { id, header: { id, ...(options?.meta ?? {}) }, events: [] }
+    },
+    enter(session) {
+      markerCalls.push(['enter', session.id])
+      return () => markerCalls.push(['detach', session.id])
+    },
+    announce(session) {
+      markerCalls.push(['announce', session.id])
+    },
+    _markerCalls: markerCalls,
+  }
   const toolRuntime = { register(def) { registered.set(def.name, def) } }
   const ctx = {
     tools: toolRuntime,
@@ -39,11 +57,7 @@ function makeCtx(home) {
           },
         }
       }
-      if (name === 'sessions') return {
-        store: { get: () => undefined },
-        get: () => undefined,
-        flush: async () => false,
-      }
+      if (name === 'sessions') return sessions
       if (name === 'agents') return { get: () => undefined }
       if (name === 'sessionPersistence') return { list: async () => [] }
       if (name === 'storageDomain') {
@@ -115,6 +129,13 @@ test('apply registers delete_subagent/release_subagent/list_subagents and tool e
   assert.equal(result.removed_from_ui_list, true)
   assert.equal(fs.existsSync(dir), false)
   assert.equal(ctx._projRows.has(ids[0]), false)
+
+  // The official lifecycle seam is exercised so web clients receive
+  // session-added/session-removed frames and can refresh the subagent catalog.
+  assert.equal(result.results[0].refreshPulse, true)
+  const markerCalls = ctx.get('sessions')._markerCalls
+  assert.deepEqual(markerCalls.slice(0, 3).map((call) => call[0]), ['prepare', 'enter', 'announce'])
+  assert.equal(markerCalls[markerCalls.length - 1][0], 'detach')
 })
 
 test('delete_subagent tool refuses a foreign subagent', async (t) => {
