@@ -20,6 +20,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
+import { randomUUID } from 'node:crypto'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 export const name = 'dsh-plugin-subagent-delete'
@@ -348,7 +349,69 @@ async function releaseSession(ctx, sessionId, parentAgent) {
   return { released: true, drained, stopped, sessionId }
 }
 
-async function deleteSessionCore(ctx, sessionId) {
+
+/**
+ * Publish a transient marker session through the OFFICIAL session lifecycle
+ * seam (`prepare -> enter -> announce -> detach`). This is the same mechanism
+ * a new subagent uses to light up the web UI, mirrored so a permanent delete
+ * also updates it: the marker carries parentSession, so the client runtime
+ * emits `host/session-added` + `host/session-removed` frames for a child of
+ * that parent. The companion client plugin (lib/client.js) sees the removed
+ * child marker and refreshes the parent subagent catalog + session list.
+ *
+ * Session.create seeds permission/sandbox events; we flush them so the
+ * `_no-cwd` artifact is materialized before detach and can be swept below.
+ */
+async function sweepMarkerDirs(markerId) {
+  for (let pass = 0; pass < 25; pass++) {
+    removeSessionDirs(markerId)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    if (findSessionDirs(markerId).length === 0) return true
+  }
+  removeSessionDirs(markerId)
+  return findSessionDirs(markerId).length === 0
+}
+
+async function emitRemovalMarker(ctx, parentSessionId) {
+  const sessions = ctx.get('sessions')
+  if (!sessions || typeof sessions.prepare !== 'function') return false
+  const markerId = `session-${randomUUID()}`
+  try {
+    const marker = sessions.prepare(markerId, { meta: { parentSession: parentSessionId } })
+    const detach = sessions.enter(marker)
+    try {
+      sessions.announce(marker)
+      // Session.create seeds permission/sandbox events; force the persistence
+      // backend to materialize them BEFORE detaching so the marker artifact is
+      // already on disk when we sweep it below.
+      if (typeof sessions.flush === 'function') await sessions.flush(marker)
+      // Keep the marker announced across at least one client notifier flush.
+      // Announcing and detaching in the same microtask lets the client batch
+      // session-added and session-removed into one snapshot, so the companion
+      // client plugin never observes the removal and cannot refresh the
+      // subagent catalog. 250ms is long enough for the SSE frame + microtask
+      // flush, short enough to be an invisible blink in the sidebar.
+      await new Promise((resolve) => setTimeout(resolve, 250))
+    } finally {
+      detach()
+    }
+
+    // The marker's disposal retirement may append one final flush; sweep until
+    // the `_no-cwd` artifact is gone so the refresh glue leaves no trace.
+    await sweepMarkerDirs(markerId)
+    return true
+  } catch {
+    // The marker is best-effort UI refresh glue; deletion has already happened.
+    try {
+      await sweepMarkerDirs(markerId)
+    } catch {
+      // ignore
+    }
+    return false
+  }
+}
+
+async function deleteSessionCore(ctx, sessionId, parentSessionId) {
   if (!SESSION_ID_RE.test(sessionId)) {
     throw new DeleteError(`invalid session id: ${sessionId}`, 400, 'invalid-session-id')
   }
@@ -379,6 +442,11 @@ async function deleteSessionCore(ctx, sessionId) {
   if (!dirRemoved && !projRemoved && !workspaceRemoved && !live && !detached) {
     throw new DeleteError(`subagent session not found: ${sessionId}`, 404, 'not-found')
   }
+
+  // Symmetric to subagent creation: publish a disposal marker so every open
+  // web client refreshes the parent subagent catalog immediately.
+  const refreshPulse = parentSessionId !== undefined ? await emitRemovalMarker(ctx, parentSessionId) : false
+
   return {
     sessionId,
     deleted: true,
@@ -387,6 +455,7 @@ async function deleteSessionCore(ctx, sessionId) {
     dirRemoved,
     projRemoved,
     workspaceRemoved,
+    refreshPulse,
   }
 }
 
@@ -525,7 +594,7 @@ function apply(ctx) {
         try {
           const targets = await collectTargets(targetCtx, parentSessionId, subagentId, args.recursive === true, undefined)
           const results = []
-          for (const id of targets) results.push(await deleteSessionCore(targetCtx, id))
+          for (const id of targets) results.push(await deleteSessionCore(targetCtx, id, parentSessionId))
           sendJson(res, 200, { ok: true, deleted: targets, results })
         } catch (error) {
           sendJson(res, error instanceof DeleteError ? error.status : 500, { ok: false, error: error.message })
@@ -595,7 +664,7 @@ function apply(ctx) {
       const targets = await collectTargets(ctx, callerSessionId, args.subagent_id, args.recursive === true, exec.signal)
       const results = []
       for (const id of targets) {
-        results.push(await deleteSessionCore(ctx, id))
+        results.push(await deleteSessionCore(ctx, id, callerSessionId))
       }
       return {
         parent_session_id: callerSessionId,
