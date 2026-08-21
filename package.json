@@ -19,6 +19,8 @@
   "files": [
     "src/",
     "lib/client.js",
+    "examples/",
+    "docs/",
     "cordis.patch.yml",
     "README.md",
     "README.zh.md",
