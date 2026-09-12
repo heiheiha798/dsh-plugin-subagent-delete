@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-subagent-delete",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "DeepSeek Harness plugin: ownership-checked delete_subagent / release_subagent / list_subagents tools and host routes that permanently remove subagent sessions from the web UI list.",
   "type": "module",
   "license": "MIT",
@@ -42,11 +42,11 @@
       "patch": "./cordis.patch.yml"
     },
     "client": {
+      "platform": "web",
       "inject": [
-        "@deepseek-ai/dsh-client-runtime",
-        "@deepseek-ai/dsh-client-ui-slots"
-      ],
-      "platform": "web"
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
     }
   },
   "peerDependencies": {

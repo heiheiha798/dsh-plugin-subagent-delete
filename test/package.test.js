@@ -16,8 +16,8 @@ test('package manifest is installable and declares both bundle and web client', 
   assert.equal(pkg.name, 'dsh-plugin-subagent-delete')
   assert.equal(pkg.dsh.bundle.patch, './cordis.patch.yml')
   assert.deepEqual(pkg.dsh.client.inject, [
-    '@deepseek-ai/dsh-client-runtime',
-    '@deepseek-ai/dsh-client-ui-slots',
+    '@deepseek-ai/dsh-api-session-controller',
+    '@deepseek-ai/dsh-client-ui-conversation',
   ])
   assert.equal(pkg.dsh.client.platform, 'web')
   assert.ok(pkg.peerDependencies['@deepseek-ai/dsh-tools'])

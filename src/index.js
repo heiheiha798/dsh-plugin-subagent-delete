@@ -243,13 +243,19 @@ async function resolveDescendants(ctx, rootId, signal) {
   if (!persistence || typeof persistence.list !== 'function') {
     return []
   }
-  const headers = await persistence.list()
+  // dsh >= 0.1.5-rc returns SessionPersistenceSnapshot rows that wrap the
+  // SessionHeader in `.header`; older versions returned header fields at the
+  // top level. Normalize both so the lineage walk below reads one shape.
+  const headerOf = (snapshot) => (snapshot !== null && typeof snapshot === 'object' ? snapshot.header ?? snapshot : undefined)
+  const snapshots = await persistence.list()
   const byId = new Map()
-  for (const header of headers) {
+  for (const snapshot of snapshots) {
+    const header = headerOf(snapshot)
+    if (header === undefined || header.id === undefined) continue
     byId.set(header.id, header)
   }
   const out = []
-  for (const header of headers) {
+  for (const header of byId.values()) {
     if (header.id === rootId) continue
     // Walk the parent chain; include only subagent-origin descendants.
     let cursor = header
@@ -501,8 +507,13 @@ async function collectTargets(ctx, callerSessionId, subagentId, recursive, signa
 async function findHeader(ctx, sessionId) {
   const persistence = ctx.get('sessionPersistence')
   if (!persistence || typeof persistence.list !== 'function') return undefined
-  const headers = await persistence.list()
-  return headers.find((h) => h.id === sessionId) ?? null
+  const snapshots = await persistence.list()
+  // Same wrapped-vs-flat normalization as resolveDescendants.
+  for (const snapshot of snapshots) {
+    const header = snapshot !== null && typeof snapshot === 'object' ? snapshot.header ?? snapshot : undefined
+    if (header?.id === sessionId) return header
+  }
+  return null
 }
 
 // --- HTTP ---------------------------------------------------------------------
