@@ -124,3 +124,28 @@ test('collectTargets rejects a subagent that is not a descendant', async () => {
     (error) => error.code === 'not-your-subagent',
   )
 })
+
+test('resolveDescendants walks lineage from dsh >= 0.1.5-rc wrapped persistence snapshots', async () => {
+  // No ctx.subagents seam: the persistence fallback must carry the walk alone.
+  // SessionPersistenceSnapshot rows wrap the SessionHeader in `.header`.
+  const ctx = {
+    get(name) {
+      if (name === 'agents') return { get: () => undefined }
+      if (name === 'sessionPersistence') {
+        return {
+          list: async () => [
+            { header: { id: parent, parentSession: undefined }, revision: 'r0' },
+            { header: { id: ids[0], parentSession: parent, origin: 'subagent' }, revision: 'r1' },
+            { header: { id: ids[1], parentSession: ids[0], origin: 'subagent' }, revision: 'r2' },
+            { header: { id: 'session-ffffffff-0000-4000-8000-000000000000', parentSession: undefined }, revision: 'r3' },
+          ],
+        }
+      }
+      return undefined
+    },
+  }
+  const out = await resolveDescendants(ctx, parent)
+  assert.equal(out.length, 2)
+  assert.ok(out.some((entry) => entry.id === ids[0] && entry.parentId === parent))
+  assert.ok(out.some((entry) => entry.id === ids[1] && entry.parentId === ids[0]))
+})

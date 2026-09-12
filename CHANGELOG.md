@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.1 — 2026-09-12
+
+### Fixed
+
+- Compatibility with dsh 0.1.5-rc: `sessionPersistence.list()` now returns
+  `SessionPersistenceSnapshot` rows that wrap the `SessionHeader` in `.header`.
+  The lineage-walk fallback (`resolveDescendants`) and `findHeader` normalize
+  both the wrapped and the legacy flat shape, so descendant discovery and
+  ownership checks keep working against current dsh.
+- `dsh.client.inject` no longer names `@deepseek-ai/dsh-client-runtime`
+  (removed from dsh on 2026-08-22 when Client ownership moved into the Session
+  Controller) nor the baseline-implicit `ui-slots`. It now declares the actual
+  providers: `@deepseek-ai/dsh-api-session-controller` (client `sessions`
+  service) and `@deepseek-ai/dsh-client-ui-conversation` (conversation slot
+  domain).
+
 ## 0.2.0 — 2026-08-21
 
 ### Added
