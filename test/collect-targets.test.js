@@ -125,6 +125,58 @@ test('collectTargets rejects a subagent that is not a descendant', async () => {
   )
 })
 
+test('resolveDescendants falls back to persisted headers when the subagent seam rejects', async () => {
+  // dsh >= 0.2.1 rejects listDescendants with SUBAGENT_CONTROL_QUERY_UNAVAILABLE
+  // when the session query or catalog projection is not composed.
+  const ctx = {
+    get(name) {
+      if (name === 'agents') return { get: () => undefined }
+      if (name === 'subagents') {
+        return {
+          listDescendants: async () => {
+            const error = new Error('listing subagents requires the sessionQuery service')
+            error.code = 'SUBAGENT_CONTROL_QUERY_UNAVAILABLE'
+            throw error
+          },
+        }
+      }
+      if (name === 'sessionPersistence') {
+        return {
+          list: async () => [
+            { header: { id: parent, parentSession: undefined }, revision: 'r0' },
+            { header: { id: ids[0], parentSession: parent, origin: 'subagent' }, revision: 'r1' },
+          ],
+        }
+      }
+      return undefined
+    },
+  }
+  const out = await resolveDescendants(ctx, parent)
+  assert.equal(out.length, 1)
+  assert.equal(out[0].id, ids[0])
+  assert.equal(out[0].parentId, parent)
+})
+
+test('resolveDescendants forwards cancellation instead of falling back', async () => {
+  const controller = new AbortController()
+  controller.abort()
+  const ctx = {
+    get(name) {
+      if (name === 'subagents') {
+        return {
+          listDescendants: async () => {
+            const error = new Error('subagent listing was cancelled')
+            error.code = 'CANCELLED'
+            throw error
+          },
+        }
+      }
+      return undefined
+    },
+  }
+  await assert.rejects(() => resolveDescendants(ctx, parent, controller.signal), (error) => error.code === 'CANCELLED')
+})
+
 test('resolveDescendants walks lineage from dsh >= 0.1.5-rc wrapped persistence snapshots', async () => {
   // No ctx.subagents seam: the persistence fallback must carry the walk alone.
   // SessionPersistenceSnapshot rows wrap the SessionHeader in `.header`.

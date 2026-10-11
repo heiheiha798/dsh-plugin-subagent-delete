@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-subagent-delete",
-  "version": "0.2.1",
-  "description": "DeepSeek Harness plugin: ownership-checked delete_subagent / release_subagent / list_subagents tools and host routes that permanently remove subagent sessions from the web UI list.",
+  "version": "0.2.2",
+  "description": "DeepSeek Harness plugin: ownership-checked delete_subagent / release_subagent / list_subagents tools and host routes that permanently remove subagent sessions and refresh open web clients.",
   "type": "module",
   "license": "MIT",
   "keywords": [
@@ -50,11 +50,12 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.8 <0.2.0-0"
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.8 <0.2.0-0 || >=0.2.0-rc.2 <0.3.0-0"
   },
   "scripts": {
     "test": "node --test",
-    "check": "node --check src/index.js && node --test",
+    "check": "node --check src/index.js && node --check lib/client.js && node --test",
+    "verify:dsh": "node scripts/verify-published-dsh.mjs",
     "pack:dry": "npm pack --dry-run",
     "prepublishOnly": "npm run check"
   },

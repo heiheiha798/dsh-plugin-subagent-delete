@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.2.2 — 2026-10-11
+
+Compatibility with dsh `0.2.1-alpha.2` (managed subagent activations).
+
+### Added
+
+- `npm run verify:dsh [version]` — a repeatable contract probe that installs
+  the requested published `@deepseek-ai/dsh-*` release into a temp directory and
+  drives `src/index.js` through that release's real `ToolRuntime`: tool
+  registration, schema compilation, and `list_subagents` / `delete_subagent` /
+  `release_subagent` execution, including the exact-parent release call and the
+  ownership refusal. Verified green against `0.2.1-alpha.2`.
+
+### Changed
+
+- Release/teardown now uses the current `ctx.subagents.drainChildren(parent,
+  childIds)` seam, resolving each target's own live direct parent instead of
+  assuming the caller is the direct parent. The pre-0.2.1
+  `drainContinuableChildren` spelling is still used when the composition
+  exposes only that one.
+- Descendant discovery falls back to the persisted-header lineage walk when
+  `ctx.subagents.listDescendants()` rejects with
+  `SUBAGENT_CONTROL_*_UNAVAILABLE` (session query or catalog projection not
+  composed); cancellation is forwarded instead of falling back.
+- `listDescendants` rows are normalized for the current contract: `diagnostic`
+  rows surface as `mode: "unknown"` with `unreadable: corrupt | unsupported |
+  unavailable`, `mode` accepts `external | unknown`, and every listing row
+  now reports `present` (the durable session artifact still exists).
+- `deleteSessionCore` is idempotent: a catalog child whose durable session is
+  already gone reports `deleted: false, alreadyAbsent: true` instead of
+  failing with `not-found`, so recursive deletes no longer abort mid-subtree.
+  `delete_subagent` returns `deleted` and `already_absent` id lists.
+- The web client glue refreshes through `sessions.refreshProjections(parentId)`
+  (current face) and keeps `sessions.refreshSubagents(parentId)` as the
+  pre-0.2.1 fallback; `session/disposed` is delivered to clients as
+  `api-session/removed` in current dsh.
+- Teardown timeouts no longer leave a 15 s timer behind, so a delete/release
+  call cannot keep the host event loop alive after it settles.
+- `peerDependencies` widened to `>=0.1.0-rc.8 <0.2.0-0 || >=0.2.0-rc.2
+  <0.3.0-0`.
+
+### Known limitation
+
+- The parent Session's `subagent/catalog` facts dsh emits at child creation are
+  append-only durable history: a permanently deleted child is dropped from the
+  sidebar session list after the refresh, but can remain a historical row in
+  the parent's header catalog dropdown. Removing that fact would require
+  rewriting the parent's committed session log, which dsh does not support.
+
 ## 0.2.1 — 2026-09-12
 
 ### Fixed

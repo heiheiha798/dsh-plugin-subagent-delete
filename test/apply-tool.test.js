@@ -9,20 +9,28 @@ const parent = 'session-95da8aa3-5611-4e59-9eee-697b6e345fd1'
 const fixture = JSON.parse(fs.readFileSync(new URL('./fixtures/test-subagents.json', import.meta.url), 'utf8'))
 const ids = fixture.subagentIds
 
-function makeCtx(home) {
+function makeCtx(home, options = {}) {
   const registered = new Map()
-  const projRows = new Map(ids.map((id) => [id, { identity: {}, rows: {} }]))
+  // Only the fixture subagent that really exists on disk has a cached projection row.
+  const projRows = new Map([[ids[0], { identity: {}, rows: {} }]])
   const workspaceRows = new Map()
   const globalState = { archivedSessionIds: [], initialized: true, workspaceIds: [] }
 
+  const parentAgent = {
+    id: parent,
+    status: 'running',
+    cancel() { drainCalls.push(['cancel', this.id]) },
+    whenIdle: async () => {},
+  }
+  const drainCalls = []
   const markerCalls = []
   const sessions = {
-    store: { get: () => undefined },
+    store: { get: () => undefined, delete: () => false },
     get: () => undefined,
     flush: async () => false,
-    prepare(id, options) {
-      markerCalls.push(['prepare', id, options])
-      return { id, header: { id, ...(options?.meta ?? {}) }, events: [] }
+    prepare(id, opts) {
+      markerCalls.push(['prepare', id, opts])
+      return { id, header: { id, ...(opts?.meta ?? {}) }, events: [] }
     },
     enter(session) {
       markerCalls.push(['enter', session.id])
@@ -34,31 +42,38 @@ function makeCtx(home) {
     _markerCalls: markerCalls,
   }
   const toolRuntime = { register(def) { registered.set(def.name, def) } }
+  const routes = []
+  const webServer = options.withHttp === true
+    ? { register(route) { routes.push(route); return () => {} } }
+    : undefined
   const ctx = {
     tools: toolRuntime,
-    effect() {},
-    inject(names, cb) { cb({ ...ctx, webServer: undefined }) },
+    effect(fn) { return fn() },
+    // Cordis invokes an inject callback only once the service exists.
+    inject(names, cb) { if (webServer !== undefined) cb({ ...ctx, webServer }) },
     get(name) {
       if (name === 'tools') return toolRuntime
+      if (name === 'webServer') return webServer
       if (name === 'subagents') {
+        const rows = options.rows ?? ids.map((id, i) => ({
+          kind: 'child',
+          id,
+          parentId: parent,
+          depth: 1,
+          activity: 'inactive',
+          mode: 'one-shot',
+          label: `test subagent ${i + 1}`,
+          hasChildren: false,
+        }))
         return {
-          listDescendants: async (rootId) => {
-            if (rootId !== parent) return []
-            return ids.map((id, i) => ({
-              kind: 'child',
-              id,
-              parentId: parent,
-              depth: 1,
-              activity: 'inactive',
-              mode: 'one-shot',
-              label: `test subagent ${i + 1}`,
-              hasChildren: false,
-            }))
-          },
+          listDescendants: async (rootId) => (rootId !== parent ? [] : rows),
+          drainChildren: async (agent, childIds) => { drainCalls.push(['drainChildren', agent, childIds]) },
         }
       }
       if (name === 'sessions') return sessions
-      if (name === 'agents') return { get: () => undefined }
+      if (name === 'agents') {
+        return { get: (id) => (id === parent ? parentAgent : undefined) }
+      }
       if (name === 'sessionPersistence') return { list: async () => [] }
       if (name === 'storageDomain') {
         return {
@@ -93,15 +108,23 @@ function makeCtx(home) {
     },
     _registered: registered,
     _projRows: projRows,
+    _drainCalls: drainCalls,
+    _parentAgent: parentAgent,
+    _routes: routes,
   }
   return ctx
 }
 
-test('apply registers delete_subagent/release_subagent/list_subagents and tool execute removes a fixture subagent', async (t) => {
+function tempHome(t) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-subagent-delete-apply-'))
   t.after(() => fs.rmSync(home, { recursive: true, force: true }))
   process.env.DSH_HOME = home
   t.after(() => { delete process.env.DSH_HOME })
+  return home
+}
+
+test('apply registers delete_subagent/release_subagent/list_subagents and tool execute removes a fixture subagent', async (t) => {
+  const home = tempHome(t)
 
   // One of the ten fixture subagents exists on disk.
   const dir = path.join(home, 'sessions', '--data-home-tianjianyang-dsh_plugins--', ids[0])
@@ -118,31 +141,116 @@ test('apply registers delete_subagent/release_subagent/list_subagents and tool e
   }
 
   const exec = {
-    agent: { id: parent },
+    agent: ctx._parentAgent,
     signal: new AbortController().signal,
   }
   const list = await defs.get('list_subagents').execute({}, exec)
   assert.equal(list.length, 10)
+  assert.equal(list.find((entry) => entry.id === ids[0]).present, true)
+  assert.equal(list.find((entry) => entry.id === ids[1]).present, false)
 
   const result = await defs.get('delete_subagent').execute({ subagent_id: ids[0], recursive: false }, exec)
   assert.deepEqual(result.deleted, [ids[0]])
-  assert.equal(result.removed_from_ui_list, true)
+  assert.deepEqual(result.already_absent, [])
   assert.equal(fs.existsSync(dir), false)
   assert.equal(ctx._projRows.has(ids[0]), false)
 
   // The official lifecycle seam is exercised so web clients receive
-  // session-added/session-removed frames and can refresh the subagent catalog.
+  // api-session/added + api-session/removed frames and can refresh.
   assert.equal(result.results[0].refreshPulse, true)
   const markerCalls = ctx.get('sessions')._markerCalls
   assert.deepEqual(markerCalls.slice(0, 3).map((call) => call[0]), ['prepare', 'enter', 'announce'])
   assert.equal(markerCalls[markerCalls.length - 1][0], 'detach')
 })
 
+test('delete_subagent reports an already-absent catalog child instead of failing', async (t) => {
+  const home = tempHome(t)
+  const ctx = makeCtx(home)
+  const cleanup = await apply(ctx)
+  t.after(() => cleanup())
+
+  const exec = { agent: ctx._parentAgent, signal: new AbortController().signal }
+  const result = await ctx._registered.get('delete_subagent').execute({ subagent_id: ids[3], recursive: false }, exec)
+  assert.deepEqual(result.deleted, [])
+  assert.deepEqual(result.already_absent, [ids[3]])
+  // Nothing was removed, so no refresh marker is published.
+  assert.equal(ctx.get('sessions')._markerCalls.length, 0)
+})
+
+test('release_subagent drains the resident child through the exact live parent', async (t) => {
+  const home = tempHome(t)
+  const ctx = makeCtx(home)
+  const cleanup = await apply(ctx)
+  t.after(() => cleanup())
+
+  const exec = { agent: ctx._parentAgent, signal: new AbortController().signal }
+  const result = await ctx._registered.get('release_subagent').execute({ subagent_id: ids[2], recursive: false }, exec)
+  assert.deepEqual(result.released, [ids[2]])
+  assert.equal(result.results[0].drained, true)
+  assert.deepEqual(ctx._drainCalls[0], ['drainChildren', ctx._parentAgent, [ids[2]]])
+})
+
+test('list_subagents surfaces an unreadable child catalog branch', async (t) => {
+  const home = tempHome(t)
+  const ctx = makeCtx(home, {
+    rows: [
+      { kind: 'child', id: ids[0], parentId: parent, depth: 1, activity: 'running', mode: 'continuable', label: 'live', hasChildren: true },
+      { kind: 'diagnostic', id: ids[1], parentId: parent, depth: 1, reason: 'corrupt' },
+    ],
+  })
+  const cleanup = await apply(ctx)
+  t.after(() => cleanup())
+
+  const exec = { agent: ctx._parentAgent, signal: new AbortController().signal }
+  const listed = await ctx._registered.get('list_subagents').execute({}, exec)
+  assert.equal(listed.length, 2)
+  const broken = listed.find((entry) => entry.id === ids[1])
+  assert.equal(broken.unreadable, 'corrupt')
+  assert.equal(broken.activity, 'inactive')
+
+  // A diagnostic branch is still a deletable target.
+  const targets = await ctx._registered.get('list_subagents').execute({ mode: 'unknown' }, exec)
+  assert.deepEqual(targets.map((entry) => entry.id), [ids[1]])
+})
+
+test('apply registers the three HTTP routes and serves the list route', async (t) => {
+  const home = tempHome(t)
+  const ctx = makeCtx(home, { withHttp: true })
+  const cleanup = await apply(ctx)
+  t.after(() => cleanup())
+
+  assert.deepEqual(ctx._routes.map((route) => route.path), [
+    '/dsh-plugin-subagent-delete/list',
+    '/dsh-plugin-subagent-delete/delete',
+    '/dsh-plugin-subagent-delete/release',
+  ])
+  assert.ok(ctx._routes.every((route) => route.kind === 'exact'))
+
+  let status
+  let body
+  const res = {
+    writeHead(code) { status = code },
+    end(payload) { body = payload },
+  }
+  await ctx._routes[0].handler(
+    { method: 'GET', url: `/dsh-plugin-subagent-delete/list?parentSessionId=${parent}` },
+    res,
+  )
+  assert.equal(status, 200)
+  const payload = JSON.parse(body)
+  assert.equal(payload.ok, true)
+  assert.equal(payload.subagents.length, 10)
+
+  status = undefined
+  await ctx._routes[0].handler({ method: 'GET', url: '/dsh-plugin-subagent-delete/list' }, res)
+  assert.equal(status, 400)
+
+  await ctx._routes[1].handler({ method: 'GET', url: '/dsh-plugin-subagent-delete/delete' }, res)
+  assert.equal(status, 405)
+})
+
 test('delete_subagent tool refuses a foreign subagent', async (t) => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-subagent-delete-apply2-'))
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }))
-  process.env.DSH_HOME = home
-  t.after(() => { delete process.env.DSH_HOME })
+  const home = tempHome(t)
 
   const ctx = makeCtx(home)
   const cleanup = await apply(ctx)

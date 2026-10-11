@@ -3,17 +3,28 @@
 // Provides the missing subagent lifecycle interface:
 //   * delete_subagent   permanently remove a subagent session (log dir,
 //                       projection cache, workspace accounting, live store
-//                       entry) so it disappears from the web UI list;
-//   * release_subagent  stop a running subagent / drain a continuable child
-//                       WITHOUT deleting its transcript (cold resume still
-//                       possible);
+//                       entry) so it disappears from the session list;
+//   * release_subagent  stop a running subagent / release a resident
+//                       continuable child WITHOUT deleting its transcript
+//                       (cold resume still possible);
 //   * list_subagents    list the caller's descendant subagents with
-//                       activity/mode/label/depth.
+//                       activity/mode/label/depth and durable availability.
 //
 // HTTP routes (optional web surface):
 //   GET  /dsh-plugin-subagent-delete/list?parentSessionId=...
 //   POST /dsh-plugin-subagent-delete/delete   { parentSessionId, subagentId, recursive? }
 //   POST /dsh-plugin-subagent-delete/release  { parentSessionId, subagentId, recursive? }
+//
+// dsh compatibility (verified against dsh 0.2.1-alpha.2):
+//   * discovery prefers `ctx.subagents.listDescendants()` and falls back to a
+//     persisted-header lineage walk when the subagent seam is absent or its
+//     session-query dependencies are unavailable;
+//   * release uses the current `drainChildren(parent, childIds)` seam and the
+//     pre-0.2.1 `drainContinuableChildren` spelling when that is what the
+//     composition exposes;
+//   * a permanent delete publishes a transient child marker through the
+//     official session lifecycle (prepare -> enter -> announce -> detach) so
+//     open web clients are told to refresh their session list and projections.
 //
 // Safety: a tool call may only target a descendant of the calling agent's own
 // session. The HTTP route requires the same explicit parentSessionId.
@@ -36,6 +47,27 @@ class DeleteError extends Error {
     this.status = status
     this.code = code
   }
+}
+
+/**
+ * Bound one cooperative teardown without leaking its timer: a lingering
+ * `setTimeout` keeps the host event loop (and every test process) alive for the
+ * full budget even when the awaited call already settled.
+ */
+function withTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new DeleteError('teardown timed out', 500, 'teardown-timeout')), ms)
+    Promise.resolve(promise).then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (error) => {
+        clearTimeout(timer)
+        reject(error)
+      },
+    )
+  })
 }
 
 // --- generic helpers ----------------------------------------------------------
@@ -88,6 +120,33 @@ function removeSessionDirs(sessionId) {
     fs.rmSync(dir, { recursive: true, force: true })
   }
   return dirs.length > 0
+}
+
+/** One pass over the sessions root; every stored session directory name. */
+function storedSessionDirNames() {
+  const ids = new Set()
+  let slugs = []
+  try {
+    slugs = fs.readdirSync(sessionsRoot(), { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+  } catch {
+    return ids
+  }
+  for (const slug of slugs) {
+    try {
+      for (const entry of fs.readdirSync(path.join(sessionsRoot(), slug), { withFileTypes: true })) {
+        if (entry.isDirectory()) ids.add(entry.name)
+      }
+    } catch {
+      // keep scanning
+    }
+  }
+  return ids
+}
+
+function hasStoredSession(sessionId, dirNames) {
+  return sessionIdVariants(sessionId).some((variant) => dirNames.has(variant))
 }
 
 // --- storage domain cleanup ---------------------------------------------------
@@ -151,6 +210,30 @@ async function stripStorageDomains(ctx, sessionId, { workspace = true } = {}) {
 
 // --- live-session teardown ----------------------------------------------------
 
+/** The exact live Agent owning `sessionId`, used as a release/teardown authority. */
+function liveAgentFor(ctx, sessionId) {
+  const agents = ctx.get('agents')
+  if (!agents || typeof agents.get !== 'function') return undefined
+  for (const variant of sessionIdVariants(sessionId)) {
+    const agent = agents.get(variant)
+    if (agent !== undefined) return agent
+  }
+  return undefined
+}
+
+/**
+ * Resolve the exact live direct parent Agent of `parentId`, falling back to the
+ * calling Agent. dsh >= 0.2.1 authorizes a child release against the exact live
+ * direct parent, so a subtree walk must pass each target's own parent.
+ */
+function parentAgentFor(ctx, parentId, fallback) {
+  if (parentId !== undefined) {
+    const parent = liveAgentFor(ctx, parentId)
+    if (parent !== undefined) return parent
+  }
+  return fallback
+}
+
 async function stopAgentIfRunning(ctx, sessionId) {
   const agents = ctx.get('agents')
   if (!agents || typeof agents.get !== 'function') return false
@@ -168,16 +251,41 @@ async function stopAgentIfRunning(ctx, sessionId) {
     }
     if (typeof agent.whenIdle === 'function') {
       try {
-        await Promise.race([
-          agent.whenIdle(),
-          new Promise((resolve) => setTimeout(resolve, IDLE_TIMEOUT_MS)),
-        ])
+        await withTimeout(agent.whenIdle(), IDLE_TIMEOUT_MS)
       } catch {
         // proceed anyway; the hard delete removes the log regardless
       }
     }
   }
   return stopped
+}
+
+/**
+ * Release one resident child activation through the official seam. dsh >= 0.2.1
+ * exposes `drainChildren(parent, childIds)`; earlier dsh spelled the same
+ * operation `drainContinuableChildren(parent, childIds)`.
+ *
+ * The selected Activation is disposed child-side: its AgentHandle is released
+ * while the durable transcript stays resumable, and the child Session leaves
+ * the live store through its own owning fiber.
+ */
+async function drainResidentChild(ctx, sessionId, parentAgent) {
+  const subagents = ctx.get('subagents')
+  if (!subagents || !parentAgent) return false
+  const drain = typeof subagents.drainChildren === 'function'
+    ? subagents.drainChildren.bind(subagents)
+    : typeof subagents.drainContinuableChildren === 'function'
+      ? subagents.drainContinuableChildren.bind(subagents)
+      : undefined
+  if (drain === undefined) return false
+  try {
+    await withTimeout(drain(parentAgent, [sessionId]), IDLE_TIMEOUT_MS)
+    return true
+  } catch {
+    // A non-resident target, an external child, or a stale parent identity is
+    // an accepted miss: the generic agent cancel below still stops it.
+    return false
+  }
 }
 
 async function flushSessionIfLive(ctx, sessionId) {
@@ -199,24 +307,32 @@ async function flushSessionIfLive(ctx, sessionId) {
   return flushed
 }
 
-/** Remove a live session from ctx.sessions so host list/query stop returning it. */
+/**
+ * Drop a still-live session from the session store so host list/query stop
+ * returning it.
+ *
+ * dsh >= 0.2.1 keeps the enter()-scoped detach capability private to
+ * `SessionStore`; the supported removal path is disposing the owning Agent,
+ * which `drainResidentChild`/`stopAgentIfRunning` above already requested. This
+ * fallback covers a live entry left behind (no Agent or no release seam) by
+ * removing the store entry directly. Pre-0.2.1 releases that still expose
+ * `sessions.detachEntered()` use that seam instead.
+ */
 function detachLiveSession(ctx, sessionId) {
   const sessions = ctx.get('sessions')
   if (!sessions) return false
+  const store = sessions.store
+  if (store === undefined || typeof store.get !== 'function') return false
   let detached = false
   for (const variant of sessionIdVariants(sessionId)) {
     try {
-      const store = sessions.store
-      const entry = store && typeof store.get === 'function' ? store.get(variant) : undefined
+      const entry = store.get(variant)
       if (entry === undefined) continue
       if (typeof sessions.detachEntered === 'function') {
         sessions.detachEntered(entry)
         detached = true
-      } else if (store && typeof store.delete === 'function') {
+      } else if (typeof store.delete === 'function') {
         store.delete(variant)
-        if (sessions.attachments && entry.session && typeof sessions.attachments.delete === 'function') {
-          sessions.attachments.delete(entry.session)
-        }
         detached = true
       }
     } catch {
@@ -229,23 +345,38 @@ function detachLiveSession(ctx, sessionId) {
 // --- subagent discovery / authorization ---------------------------------------
 
 /**
- * Resolve the full descendant listing for `rootId`.
- * Prefer the official ctx.subagents projection-backed enumeration; fall back
- * to persisted headers when the subagent seam is not mounted.
+ * Normalize one `listDescendants` row. dsh >= 0.2.1 returns child rows
+ * (`mode` one-shot|continuable|external) plus `diagnostic` rows for a branch
+ * whose child catalog could not be read or records an unknown mode; both carry
+ * `parentId` and `depth`.
  */
-async function resolveDescendants(ctx, rootId, signal) {
-  const subagents = ctx.get('subagents')
-  if (subagents && typeof subagents.listDescendants === 'function') {
-    return await subagents.listDescendants(rootId, signal)
+function normalizeDescendantRow(row) {
+  const diagnostic = row.kind === 'diagnostic'
+  const label = typeof row.label === 'string' && row.label.length > 0 ? row.label : row.id
+  return {
+    kind: 'child',
+    id: row.id,
+    parentId: row.parentId,
+    depth: typeof row.depth === 'number' ? row.depth : 1,
+    activity: row.activity === 'running' ? 'running' : 'inactive',
+    mode: typeof row.mode === 'string' ? row.mode : 'unknown',
+    label,
+    hasChildren: row.hasChildren === true,
+    ...diagnostic ? { unreadable: row.reason } : {},
   }
+}
 
+/**
+ * Walk persisted session headers when the subagent seam is unavailable.
+ * dsh >= 0.1.5-rc returns SessionPersistenceSnapshot rows that wrap the
+ * SessionHeader in `.header`; older versions returned header fields at the top
+ * level. Normalize both so the lineage walk below reads one shape.
+ */
+async function descendantsFromPersistence(ctx, rootId) {
   const persistence = ctx.get('sessionPersistence')
   if (!persistence || typeof persistence.list !== 'function') {
     return []
   }
-  // dsh >= 0.1.5-rc returns SessionPersistenceSnapshot rows that wrap the
-  // SessionHeader in `.header`; older versions returned header fields at the
-  // top level. Normalize both so the lineage walk below reads one shape.
   const headerOf = (snapshot) => (snapshot !== null && typeof snapshot === 'object' ? snapshot.header ?? snapshot : undefined)
   const snapshots = await persistence.list()
   const byId = new Map()
@@ -268,7 +399,7 @@ async function resolveDescendants(ctx, rootId, signal) {
         out.push({
           kind: 'child',
           id: header.id,
-          activity: ctx.get('agents')?.get?.(header.id) ? 'running' : 'inactive',
+          activity: liveAgentFor(ctx, header.id) !== undefined ? 'running' : 'inactive',
           mode: 'one-shot',
           label: header.id,
           hasChildren: false,
@@ -285,8 +416,37 @@ async function resolveDescendants(ctx, rootId, signal) {
   return out
 }
 
-function entryById(entries, id) {
-  return entries.find((entry) => entry.id === id) ?? null
+/**
+ * Resolve the full descendant listing for `rootId`.
+ * Prefer the official ctx.subagents projection-backed enumeration; fall back to
+ * persisted headers when the subagent seam is not mounted or its session-query
+ * dependencies are unavailable in this composition.
+ */
+async function resolveDescendants(ctx, rootId, signal) {
+  const subagents = ctx.get('subagents')
+  if (subagents && typeof subagents.listDescendants === 'function') {
+    try {
+      const rows = await subagents.listDescendants(rootId, signal)
+      return rows.map(normalizeDescendantRow)
+    } catch (error) {
+      if (signal?.aborted === true || error?.code === 'CANCELLED') throw error
+      // dsh >= 0.2.1 rejects with SUBAGENT_CONTROL_*_UNAVAILABLE when the
+      // session query or the subagent catalog projection is not composed.
+    }
+  }
+  return await descendantsFromPersistence(ctx, rootId)
+}
+
+async function findHeader(ctx, sessionId) {
+  const persistence = ctx.get('sessionPersistence')
+  if (!persistence || typeof persistence.list !== 'function') return undefined
+  const snapshots = await persistence.list()
+  // Same wrapped-vs-flat normalization as descendantsFromPersistence.
+  for (const snapshot of snapshots) {
+    const header = snapshot !== null && typeof snapshot === 'object' ? snapshot.header ?? snapshot : undefined
+    if (header?.id === sessionId) return header
+  }
+  return null
 }
 
 /** Collect target + its whole descendant subtree. */
@@ -319,51 +479,27 @@ function collectSubtree(entries, targetId) {
 function deletionOrder(subtree) {
   return [...subtree]
     .sort((a, b) => (b.depth ?? 0) - (a.depth ?? 0) || String(a.id).localeCompare(String(b.id)))
-    .map((entry) => entry.id)
 }
 
 // --- one-session delete -------------------------------------------------------
 
-/**
- * Use the official continuable-drain seam when the parent agent is known:
- * the selected resident Activation is released child-side (its AgentHandle is
- * disposed) while the durable transcript stays resumable.
- */
-async function drainContinuableChild(ctx, sessionId, parentAgent) {
-  const subagents = ctx.get('subagents')
-  if (!subagents || !parentAgent || typeof subagents.drainContinuableChildren !== 'function') {
-    return false
-  }
-  try {
-    await Promise.race([
-      subagents.drainContinuableChildren(parentAgent, [sessionId]),
-      new Promise((resolve) => setTimeout(resolve, IDLE_TIMEOUT_MS)),
-    ])
-    return true
-  } catch {
-    // Non-resident/one-shot targets are accepted no-ops; a stale parent falls
-    // through to the generic agent cancel below.
-    return false
-  }
-}
-
 async function releaseSession(ctx, sessionId, parentAgent) {
-  const drained = await drainContinuableChild(ctx, sessionId, parentAgent)
+  const drained = await drainResidentChild(ctx, sessionId, parentAgent)
   const stopped = await stopAgentIfRunning(ctx, sessionId)
   // For a live continuable child, the official drain releases its Activation
   // while the durable session stays available for cold resume / send_message.
   return { released: true, drained, stopped, sessionId }
 }
 
-
 /**
  * Publish a transient marker session through the OFFICIAL session lifecycle
  * seam (`prepare -> enter -> announce -> detach`). This is the same mechanism
  * a new subagent uses to light up the web UI, mirrored so a permanent delete
  * also updates it: the marker carries parentSession, so the client runtime
- * emits `host/session-added` + `host/session-removed` frames for a child of
+ * emits `api-session/added` + `api-session/removed` frames for a child of
  * that parent. The companion client plugin (lib/client.js) sees the removed
- * child marker and refreshes the parent subagent catalog + session list.
+ * child marker and asks the sessions service to reload the session list and
+ * the parent's projections.
  *
  * Session.create seeds permission/sandbox events; we flush them so the
  * `_no-cwd` artifact is materialized before detach and can be swept below.
@@ -395,7 +531,7 @@ async function emitRemovalMarker(ctx, parentSessionId) {
       // Announcing and detaching in the same microtask lets the client batch
       // session-added and session-removed into one snapshot, so the companion
       // client plugin never observes the removal and cannot refresh the
-      // subagent catalog. 250ms is long enough for the SSE frame + microtask
+      // session list. 250ms is long enough for the SSE frame + microtask
       // flush, short enough to be an invisible blink in the sidebar.
       await new Promise((resolve) => setTimeout(resolve, 250))
     } finally {
@@ -417,7 +553,16 @@ async function emitRemovalMarker(ctx, parentSessionId) {
   }
 }
 
-async function deleteSessionCore(ctx, sessionId, parentSessionId) {
+/**
+ * Permanently remove one durable session.
+ * @param ctx - plugin context.
+ * @param sessionId - target session id.
+ * @param parentSessionId - durable parent whose open clients should refresh.
+ * @param options.missingOk - report an already-absent target instead of failing.
+ * @param options.parentAgent - exact live direct parent Agent authorizing the release.
+ */
+async function deleteSessionCore(ctx, sessionId, parentSessionId, options = {}) {
+  const { missingOk = false, parentAgent } = options
   if (!SESSION_ID_RE.test(sessionId)) {
     throw new DeleteError(`invalid session id: ${sessionId}`, 400, 'invalid-session-id')
   }
@@ -425,6 +570,9 @@ async function deleteSessionCore(ctx, sessionId, parentSessionId) {
   const variants = sessionIdVariants(sessionId)
   const agents = ctx.get('agents')
   const live = variants.some((v) => agents && typeof agents.get === 'function' && agents.get(v) !== undefined)
+  // Official teardown first: disposing the resident Activation releases the
+  // child's AgentHandle, which detaches its Session from the live store.
+  const drained = await drainResidentChild(ctx, sessionId, parentAgent)
   const stopped = await stopAgentIfRunning(ctx, sessionId)
   await flushSessionIfLive(ctx, sessionId)
   const detached = detachLiveSession(ctx, sessionId)
@@ -445,18 +593,26 @@ async function deleteSessionCore(ctx, sessionId, parentSessionId) {
   const dirRemoved = firstDirRemoved || secondDirRemoved
   const projRemoved = projStorage.projRemoved || workspaceStorage.projRemoved
   const workspaceRemoved = workspaceStorage.workspaceRemoved
-  if (!dirRemoved && !projRemoved && !workspaceRemoved && !live && !detached) {
+  // `drained` alone proves nothing: the release seam resolves as an accepted
+  // no-op for a target that is not resident under this parent.
+  const removedAnything = dirRemoved || projRemoved || workspaceRemoved || live || detached
+  if (!removedAnything && !missingOk) {
     throw new DeleteError(`subagent session not found: ${sessionId}`, 404, 'not-found')
   }
 
   // Symmetric to subagent creation: publish a disposal marker so every open
-  // web client refreshes the parent subagent catalog immediately.
-  const refreshPulse = parentSessionId !== undefined ? await emitRemovalMarker(ctx, parentSessionId) : false
+  // web client refreshes the session list and the parent's projections.
+  let refreshPulse = false
+  if (removedAnything && parentSessionId !== undefined) {
+    refreshPulse = await emitRemovalMarker(ctx, parentSessionId)
+  }
 
   return {
     sessionId,
-    deleted: true,
+    deleted: removedAnything,
+    alreadyAbsent: !removedAnything,
     stopped,
+    drained,
     detached,
     dirRemoved,
     projRemoved,
@@ -467,7 +623,11 @@ async function deleteSessionCore(ctx, sessionId, parentSessionId) {
 
 // --- tool-facing operations ----------------------------------------------------
 
-async function collectTargets(ctx, callerSessionId, subagentId, recursive, signal) {
+/**
+ * Collect the target and its subtree, child-first.
+ * @returns subtree entries ordered child-first (target last).
+ */
+async function collectTargetEntries(ctx, callerSessionId, subagentId, recursive, signal) {
   if (!SESSION_ID_RE.test(String(subagentId))) {
     throw new DeleteError(`invalid subagent id: ${subagentId}`, 400, 'invalid-session-id')
   }
@@ -504,16 +664,8 @@ async function collectTargets(ctx, callerSessionId, subagentId, recursive, signa
   return deletionOrder(subtree)
 }
 
-async function findHeader(ctx, sessionId) {
-  const persistence = ctx.get('sessionPersistence')
-  if (!persistence || typeof persistence.list !== 'function') return undefined
-  const snapshots = await persistence.list()
-  // Same wrapped-vs-flat normalization as resolveDescendants.
-  for (const snapshot of snapshots) {
-    const header = snapshot !== null && typeof snapshot === 'object' ? snapshot.header ?? snapshot : undefined
-    if (header?.id === sessionId) return header
-  }
-  return null
+async function collectTargets(ctx, callerSessionId, subagentId, recursive, signal) {
+  return (await collectTargetEntries(ctx, callerSessionId, subagentId, recursive, signal)).map((entry) => entry.id)
 }
 
 // --- HTTP ---------------------------------------------------------------------
@@ -543,6 +695,12 @@ function readBody(req) {
   })
 }
 
+/** Annotate one listing with durable availability in a single directory pass. */
+function withAvailability(entries) {
+  const stored = storedSessionDirNames()
+  return entries.map((entry) => ({ ...entry, present: hasStoredSession(entry.id, stored) }))
+}
+
 async function httpList(ctx, query) {
   const parentSessionId = String(query.get('parentSessionId') ?? '').trim()
   if (!SESSION_ID_RE.test(parentSessionId)) {
@@ -551,11 +709,11 @@ async function httpList(ctx, query) {
   const entries = await resolveDescendants(ctx, parentSessionId, undefined)
   const activity = query.get('activity')
   const mode = query.get('mode')
-  return entries.filter((entry) => {
+  return withAvailability(entries.filter((entry) => {
     if (activity && entry.activity !== activity) return false
     if (mode && entry.mode !== mode) return false
     return true
-  })
+  }))
 }
 
 // --- plugin --------------------------------------------------------------------
@@ -564,7 +722,7 @@ function apply(ctx) {
   const callerSessionIdOf = (exec) => {
     const id = exec?.agent?.id
     if (typeof id !== 'string' || id.length === 0) {
-      throw new DeleteError('delete_subagent can only run inside an agent session', 400, 'no-caller-agent')
+      throw new DeleteError('this tool can only run inside an agent session', 400, 'no-caller-agent')
     }
     return id
   }
@@ -603,10 +761,15 @@ function apply(ctx) {
           return sendJson(res, 400, { ok: false, error: 'parentSessionId and subagentId are required' })
         }
         try {
-          const targets = await collectTargets(targetCtx, parentSessionId, subagentId, args.recursive === true, undefined)
+          const targets = await collectTargetEntries(targetCtx, parentSessionId, subagentId, args.recursive === true, undefined)
           const results = []
-          for (const id of targets) results.push(await deleteSessionCore(targetCtx, id, parentSessionId))
-          sendJson(res, 200, { ok: true, deleted: targets, results })
+          for (const entry of targets) {
+            results.push(await deleteSessionCore(targetCtx, entry.id, parentSessionId, {
+              missingOk: true,
+              parentAgent: parentAgentFor(targetCtx, entry.parentId, undefined),
+            }))
+          }
+          sendJson(res, 200, { ok: true, deleted: results.filter((r) => r.deleted).map((r) => r.sessionId), results })
         } catch (error) {
           sendJson(res, error instanceof DeleteError ? error.status : 500, { ok: false, error: error.message })
         }
@@ -631,11 +794,13 @@ function apply(ctx) {
           return sendJson(res, 400, { ok: false, error: 'parentSessionId and subagentId are required' })
         }
         try {
-          const targets = await collectTargets(targetCtx, parentSessionId, subagentId, args.recursive === true, undefined)
-          const parentAgent = targetCtx.get('agents')?.get?.(parentSessionId)
+          const targets = await collectTargetEntries(targetCtx, parentSessionId, subagentId, args.recursive === true, undefined)
+          const parentAgent = liveAgentFor(targetCtx, parentSessionId)
           const results = []
-          for (const id of targets) results.push(await releaseSession(targetCtx, id, parentAgent))
-          sendJson(res, 200, { ok: true, released: targets, results })
+          for (const entry of targets) {
+            results.push(await releaseSession(targetCtx, entry.id, parentAgentFor(targetCtx, entry.parentId, parentAgent)))
+          }
+          sendJson(res, 200, { ok: true, released: targets.map((entry) => entry.id), results })
         } catch (error) {
           sendJson(res, error instanceof DeleteError ? error.status : 500, { ok: false, error: error.message })
         }
@@ -648,7 +813,8 @@ function apply(ctx) {
     description:
       'Permanently delete one subagent session that belongs to the current session tree. '
       + 'Stops it if it is running, removes its durable log, projection cache and workspace accounting, '
-      + 'and takes it out of the web UI subagent list. Set recursive: true when the subagent has descendants. '
+      + 'and asks every open web client to reload its session list. '
+      + 'Set recursive: true when the subagent has descendants. '
       + 'Prefer this over deleting session files manually.',
     parameters: {
       subagent_id: {
@@ -672,15 +838,18 @@ function apply(ctx) {
     },
     async execute(args, exec) {
       const callerSessionId = callerSessionIdOf(exec)
-      const targets = await collectTargets(ctx, callerSessionId, args.subagent_id, args.recursive === true, exec.signal)
+      const targets = await collectTargetEntries(ctx, callerSessionId, args.subagent_id, args.recursive === true, exec.signal)
       const results = []
-      for (const id of targets) {
-        results.push(await deleteSessionCore(ctx, id, callerSessionId))
+      for (const entry of targets) {
+        results.push(await deleteSessionCore(ctx, entry.id, callerSessionId, {
+          missingOk: true,
+          parentAgent: parentAgentFor(ctx, entry.parentId, exec.agent),
+        }))
       }
       return {
         parent_session_id: callerSessionId,
-        deleted: targets,
-        removed_from_ui_list: true,
+        deleted: results.filter((result) => result.deleted).map((result) => result.sessionId),
+        already_absent: results.filter((result) => result.alreadyAbsent).map((result) => result.sessionId),
         results,
       }
     },
@@ -714,14 +883,14 @@ function apply(ctx) {
     },
     async execute(args, exec) {
       const callerSessionId = callerSessionIdOf(exec)
-      const targets = await collectTargets(ctx, callerSessionId, args.subagent_id, args.recursive === true, exec.signal)
+      const targets = await collectTargetEntries(ctx, callerSessionId, args.subagent_id, args.recursive === true, exec.signal)
       const results = []
-      for (const id of targets) {
-        results.push(await releaseSession(ctx, id, exec.agent))
+      for (const entry of targets) {
+        results.push(await releaseSession(ctx, entry.id, parentAgentFor(ctx, entry.parentId, exec.agent)))
       }
       return {
         parent_session_id: callerSessionId,
-        released: targets,
+        released: targets.map((entry) => entry.id),
         results,
       }
     },
@@ -731,6 +900,7 @@ function apply(ctx) {
     name: 'list_subagents',
     description:
       'List the subagent sessions descending from the current session, including finished one-shot subagents. '
+      + 'Each row carries mode, activity, the direct parent and whether its durable session is still stored. '
       + 'Use this to obtain the exact subagent_id to pass to delete_subagent or release_subagent.',
     parameters: {
       activity: {
@@ -740,7 +910,7 @@ function apply(ctx) {
       },
       mode: {
         type: 'string',
-        enum: ['one-shot', 'continuable'],
+        enum: ['one-shot', 'continuable', 'external', 'unknown'],
         description: 'Only show subagents of this mode.',
       },
     },
@@ -756,11 +926,11 @@ function apply(ctx) {
     async execute(args, exec) {
       const callerSessionId = callerSessionIdOf(exec)
       const entries = await resolveDescendants(ctx, callerSessionId, exec.signal)
-      return entries.filter((entry) => {
+      return withAvailability(entries.filter((entry) => {
         if (args.activity !== undefined && entry.activity !== args.activity) return false
         if (args.mode !== undefined && entry.mode !== args.mode) return false
         return true
-      })
+      }))
     },
   }))
 
@@ -778,4 +948,7 @@ function apply(ctx) {
   }
 }
 
-export { apply, DeleteError, deleteSessionCore, collectTargets, resolveDescendants, sessionIdVariants }
+export {
+  apply, DeleteError, deleteSessionCore, collectTargets, collectTargetEntries,
+  resolveDescendants, sessionIdVariants,
+}

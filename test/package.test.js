@@ -36,6 +36,12 @@ test('cordis patch and client bundle contain no leftover debug output', () => {
     assert.doesNotMatch(source, /marker-debug|\[subagent-delete-client\]/, `${label} source has debug leftovers`)
   }
   assert.match(client, /byId\[id\]\.parentId/, 'client detector reads the public parentId field')
+  assert.match(client, /sessions\.refreshProjections/, 'client refreshes the parent projection on the current API')
+  assert.match(
+    client,
+    /typeof sessions\.refreshSubagents === 'function'/,
+    'client keeps the pre-0.2.1 catalog reload as a fallback',
+  )
   assert.match(host, /setTimeout\(resolve, 250\)/, 'marker stays announced across a client notifier flush')
 })
 
