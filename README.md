@@ -22,7 +22,7 @@ with an ownership-checked, model-callable tool plus optional HTTP routes.
 ```sh
 dsh plugin --profile web add github:heiheiha798/dsh-plugin-subagent-delete
 # or pin to the published release
-dsh plugin --profile web add github:heiheiha798/dsh-plugin-subagent-delete#v0.2.2
+dsh plugin --profile web add github:heiheiha798/dsh-plugin-subagent-delete#v0.2.3
 # or from a local checkout
 dsh plugin --profile web add /path/to/dsh-plugin-subagent-delete
 ```
@@ -45,7 +45,9 @@ Returns the caller's descendant subagent tree: `id`, `label`, `mode`
 (whether the durable session artifact is still stored). A child whose catalog
 branch could not be read carries `unreadable`
 (`corrupt` | `unsupported` | `unavailable`) and still counts as a deletable
-target.
+target. Children whose durable session was already permanently deleted are
+omitted; pass `include_absent: true` to list them (they report
+`present: false`).
 
 ### `delete_subagent`
 
@@ -59,18 +61,23 @@ Permanently removes the subagent:
 1. verifies the target is a descendant of the calling agent's session
    (descendant discovery uses the official `ctx.subagents.listDescendants`,
    falling back to a persisted-header lineage walk);
-2. stops the live agent / releases a resident child Activation through the
+2. when the target is a Team member and the caller is the Team Lead, dismisses
+   it from the durable Team roster through `ctx.agentTeams.dismissTeammate`, so
+   the Team panel stops listing the teammate;
+3. stops the live agent / releases a resident child Activation through the
    official `ctx.subagents.drainChildren(parent, childIds)` seam, which also
    detaches the child Session from the live store;
-3. flushes and (if still live) detaches the session from `ctx.sessions`;
-4. removes the on-disk session log directory (both uuid spellings);
-5. removes the `session_projcache` row;
-6. removes the id from workspace accounting and the archive set.
+4. flushes and (if still live) detaches the session from `ctx.sessions`;
+5. removes the on-disk session log directory (both uuid spellings);
+6. removes the `session_projcache` row;
+7. removes the id from workspace accounting and the archive set.
 
 Without `recursive: true` a target that still has descendants is refused with
 `has-descendants`. Deletion is child-first and permanent. A target whose durable
 session is already gone reports `already_absent` instead of `not-found`, so a
-subtree delete never aborts half-way.
+subtree delete never aborts half-way. Each deleted row reports `dismissed`,
+which stays `false` when the target is not a roster member, the caller is not the
+Lead, or the composition mounts no Team service.
 
 ### `release_subagent`
 
@@ -98,11 +105,16 @@ affected parents — the current dsh face (pre-0.2.1 releases used
 therefore drop the deleted subagent without a manual page reload. The marker's
 `_no-cwd` artifact is swept after detach, so the refresh glue leaves no residue.
 
-One honest limit: the parent Session's `subagent/catalog` facts are append-only
-durable history, so a deleted child can remain a **historical row** in the
-parent's header catalog dropdown until that parent log itself moves on.
-Removing the fact would mean rewriting a committed session log, which dsh does
-not support. The sidebar session list is refreshed normally.
+Team sessions additionally lose the teammate from the Team panel: a teammate is
+a durable `team/member` fact, and `delete_subagent` terminates it through the
+official Lead-only dismissal before removing the Session.
+
+One honest limit remains: the parent Session's `subagent/catalog` facts are
+append-only durable history, so a deleted child can still appear as a
+**historical row** in the parent's header catalog dropdown until that parent log
+itself moves on. Removing the fact would mean rewriting a committed session
+log, which dsh does not support. The sidebar session list is refreshed
+normally.
 
 ## HTTP routes (web profiles)
 

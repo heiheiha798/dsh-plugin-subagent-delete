@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.3 — 2026-10-22
+
+### Fixed
+
+- `delete_subagent` on a Team session now also dismisses the target from the
+  caller's durable Team roster (`ctx.agentTeams.dismissTeammate`, Lead only).
+  A teammate is a durable `team/member` fact in the Lead's Session log and the
+  Team UI renders exactly the non-dismissed roster, so deleting only the child
+  Session left the teammate listed as active and the delete looked like a
+  no-op. Each deleted row now reports `dismissed`; it stays `false` when the
+  target is not a roster member, the caller is not the Lead, or the
+  composition mounts no Team service.
+
+### Changed
+
+- `list_subagents` omits catalog children whose durable session was already
+  permanently deleted, so a finished cleanup reads back as an empty list
+  instead of rows that all report `present: false`. Pass
+  `include_absent: true` to see them. The HTTP list route keeps returning
+  every catalog row with its `present` flag.
+
 ## 0.2.2 — 2026-10-11
 
 Compatibility with dsh `0.2.1-alpha.2` (managed subagent activations).

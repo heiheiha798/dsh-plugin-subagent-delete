@@ -22,7 +22,7 @@ HTTP 路由。
 ```sh
 dsh plugin --profile web add github:heiheiha798/dsh-plugin-subagent-delete
 # 或固定到已发布版本
-dsh plugin --profile web add github:heiheiha798/dsh-plugin-subagent-delete#v0.2.2
+dsh plugin --profile web add github:heiheiha798/dsh-plugin-subagent-delete#v0.2.3
 # 或从本地目录安装
 dsh plugin --profile web add /path/to/dsh-plugin-subagent-delete
 ```
@@ -43,7 +43,8 @@ list_subagents({ mode: "one-shot" })    // 仅一次性子代理
 `external` | `unknown`）、`activity`（`running` | `inactive`）、`depth`、
 `parentId`、`hasChildren`，以及 `present`（持久化会话文件是否仍存在）。若某个子代理的
 目录分支读取失败，会带上 `unreadable`（`corrupt` | `unsupported` |
-`unavailable`），它仍然是可以删除的目标。
+`unavailable`），它仍然是可以删除的目标。持久化会话已被永久删除的目录子项默认不再
+列出；传 `include_absent: true` 可以查看它们（其 `present` 为 `false`）。
 
 ### `delete_subagent`
 
@@ -56,16 +57,20 @@ delete_subagent({ subagent_id: "<id>", recursive: true })
 
 1. 校验目标是调用代理会话的后代（后代发现使用官方 `ctx.subagents.listDescendants`，
    失败时回退到持久化 header 的血缘遍历）；
-2. 停止存活代理 / 通过官方 `ctx.subagents.drainChildren(parent, childIds)` 释放驻留的
+2. 若目标是 Team 成员且调用方是 Team Lead，先通过官方
+   `ctx.agentTeams.dismissTeammate` 把它从持久化花名册中移除，Team 面板才会真正
+   不再列出该成员；
+3. 停止存活代理 / 通过官方 `ctx.subagents.drainChildren(parent, childIds)` 释放驻留的
    子 Activation（同时把子会话从 live store 中解绑）；
-3. 如仍存活，则从 `ctx.sessions` flush 并 detach 该会话；
-4. 删除磁盘上的会话日志目录（两种 uuid 写法都会处理）；
-5. 删除 `session_projcache` 行；
-6. 从 workspace 记账和归档集合中移除该 id。
+4. 如仍存活，则从 `ctx.sessions` flush 并 detach 该会话；
+5. 删除磁盘上的会话日志目录（两种 uuid 写法都会处理）；
+6. 删除 `session_projcache` 行；
+7. 从 workspace 记账和归档集合中移除该 id。
 
 没有传 `recursive: true` 时，如果目标仍有后代，会以 `has-descendants` 拒绝。
 删除按子节点优先执行，且是永久性的。若目标的持久化会话已不存在，会返回
-`already_absent` 而不是报错，因此递归删除不会中途失败。
+`already_absent` 而不是报错，因此递归删除不会中途失败。每条删除结果都带
+`dismissed`：目标不是花名册成员、调用方不是 Lead、或未组合 Team 服务时为 `false`。
 
 ### `release_subagent`
 
@@ -88,7 +93,10 @@ Activation，但保留持久化记录。之后仍可用 `send_message` 恢复。
 `sessions.refreshSubagents(parentId)`，仍受支持）。因此删除后无需手动刷新页面，
 列表会自动更新。marker 的 `_no-cwd` 文件会在 detach 后清扫，不留残留。
 
-一个需要说明的限制：父会话的 `subagent/catalog` 事实是只追加的持久历史，所以被删除
+Team 会话还会把该成员从 Team 面板中移除：成员身份是持久化的 `team/member` 事实，
+`delete_subagent` 会先通过官方的 Lead 专属 dismiss 终止它，再删除会话。
+
+一个仍然存在的限制：父会话的 `subagent/catalog` 事实是只追加的持久历史，所以被删除
 的子代理可能仍会作为**历史条目**出现在父会话头部的子代理目录下拉框中，直到父会话日志
 本身发生迁移。要移除该事实需要重写已提交的会话日志，DSH 并不支持。侧边栏会话列表会
 正常刷新。

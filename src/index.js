@@ -308,6 +308,36 @@ async function flushSessionIfLive(ctx, sessionId) {
 }
 
 /**
+ * Dismiss one target from the caller's durable Team roster.
+ *
+ * A Team member is a durable `team/member` fact in the Lead's Session log and
+ * the Team UI renders exactly the non-dismissed roster, so deleting the child
+ * Session alone leaves the teammate listed with phase `active`. The official
+ * dismissal appends the terminal fact (Lead only) and stops the live member;
+ * the resulting projection update removes the row from the Team panel.
+ *
+ * Absent when the composition mounts no Team service, when the target is not a
+ * roster member, or when the caller is not the Lead.
+ */
+async function dismissTeamMember(ctx, callerAgent, sessionId) {
+  if (!callerAgent) return false
+  const teams = ctx.get('agentTeams')
+  if (!teams || typeof teams.listMembers !== 'function' || typeof teams.dismissTeammate !== 'function') {
+    return false
+  }
+  const variants = new Set(sessionIdVariants(sessionId))
+  try {
+    const member = teams.listMembers(callerAgent).find((entry) => variants.has(entry.id))
+    if (member === undefined || member.role === 'lead') return false
+    await teams.dismissTeammate(callerAgent, member.name)
+    return true
+  } catch {
+    // Not a roster member, not the Lead, or the Team seam is not composed.
+    return false
+  }
+}
+
+/**
  * Drop a still-live session from the session store so host list/query stop
  * returning it.
  *
@@ -560,9 +590,10 @@ async function emitRemovalMarker(ctx, parentSessionId) {
  * @param parentSessionId - durable parent whose open clients should refresh.
  * @param options.missingOk - report an already-absent target instead of failing.
  * @param options.parentAgent - exact live direct parent Agent authorizing the release.
+ * @param options.callerAgent - live Agent authorizing a Team-roster dismissal (must be the Lead).
  */
 async function deleteSessionCore(ctx, sessionId, parentSessionId, options = {}) {
-  const { missingOk = false, parentAgent } = options
+  const { missingOk = false, parentAgent, callerAgent } = options
   if (!SESSION_ID_RE.test(sessionId)) {
     throw new DeleteError(`invalid session id: ${sessionId}`, 400, 'invalid-session-id')
   }
@@ -570,6 +601,9 @@ async function deleteSessionCore(ctx, sessionId, parentSessionId, options = {}) 
   const variants = sessionIdVariants(sessionId)
   const agents = ctx.get('agents')
   const live = variants.some((v) => agents && typeof agents.get === 'function' && agents.get(v) !== undefined)
+  // Team sessions list teammates from a durable roster fact, so a permanent
+  // delete must also dismiss the member or the Team UI keeps showing it.
+  const dismissed = await dismissTeamMember(ctx, callerAgent ?? parentAgent, sessionId)
   // Official teardown first: disposing the resident Activation releases the
   // child's AgentHandle, which detaches its Session from the live store.
   const drained = await drainResidentChild(ctx, sessionId, parentAgent)
@@ -611,6 +645,7 @@ async function deleteSessionCore(ctx, sessionId, parentSessionId, options = {}) 
     sessionId,
     deleted: removedAnything,
     alreadyAbsent: !removedAnything,
+    dismissed,
     stopped,
     drained,
     detached,
@@ -762,11 +797,13 @@ function apply(ctx) {
         }
         try {
           const targets = await collectTargetEntries(targetCtx, parentSessionId, subagentId, args.recursive === true, undefined)
+          const callerAgent = liveAgentFor(targetCtx, parentSessionId)
           const results = []
           for (const entry of targets) {
             results.push(await deleteSessionCore(targetCtx, entry.id, parentSessionId, {
               missingOk: true,
-              parentAgent: parentAgentFor(targetCtx, entry.parentId, undefined),
+              parentAgent: parentAgentFor(targetCtx, entry.parentId, callerAgent),
+              callerAgent,
             }))
           }
           sendJson(res, 200, { ok: true, deleted: results.filter((r) => r.deleted).map((r) => r.sessionId), results })
@@ -844,6 +881,7 @@ function apply(ctx) {
         results.push(await deleteSessionCore(ctx, entry.id, callerSessionId, {
           missingOk: true,
           parentAgent: parentAgentFor(ctx, entry.parentId, exec.agent),
+          callerAgent: exec.agent,
         }))
       }
       return {
@@ -901,6 +939,7 @@ function apply(ctx) {
     description:
       'List the subagent sessions descending from the current session, including finished one-shot subagents. '
       + 'Each row carries mode, activity, the direct parent and whether its durable session is still stored. '
+      + 'A child whose durable session was already permanently deleted is omitted unless include_absent is true. '
       + 'Use this to obtain the exact subagent_id to pass to delete_subagent or release_subagent.',
     parameters: {
       activity: {
@@ -912,6 +951,10 @@ function apply(ctx) {
         type: 'string',
         enum: ['one-shot', 'continuable', 'external', 'unknown'],
         description: 'Only show subagents of this mode.',
+      },
+      include_absent: {
+        type: 'boolean',
+        description: 'Also list catalog children whose durable session was already permanently deleted.',
       },
     },
     output: {
@@ -926,11 +969,12 @@ function apply(ctx) {
     async execute(args, exec) {
       const callerSessionId = callerSessionIdOf(exec)
       const entries = await resolveDescendants(ctx, callerSessionId, exec.signal)
-      return withAvailability(entries.filter((entry) => {
+      const rows = withAvailability(entries.filter((entry) => {
         if (args.activity !== undefined && entry.activity !== args.activity) return false
         if (args.mode !== undefined && entry.mode !== args.mode) return false
         return true
       }))
+      return args.include_absent === true ? rows : rows.filter((row) => row.present !== false)
     },
   }))
 
