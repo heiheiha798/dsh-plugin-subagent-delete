@@ -42,6 +42,7 @@ function makeCtx(home, options = {}) {
     _markerCalls: markerCalls,
   }
   const toolRuntime = { register(def) { registered.set(def.name, def) } }
+  const teamDismissals = []
   const routes = []
   const webServer = options.withHttp === true
     ? { register(route) { routes.push(route); return () => {} } }
@@ -68,6 +69,16 @@ function makeCtx(home, options = {}) {
         return {
           listDescendants: async (rootId) => (rootId !== parent ? [] : rows),
           drainChildren: async (agent, childIds) => { drainCalls.push(['drainChildren', agent, childIds]) },
+        }
+      }
+      if (name === 'agentTeams') {
+        if (options.agentTeams === null) return undefined
+        return options.agentTeams ?? {
+          listMembers: () => [{ id: ids[0], name: 'fixture-teammate', role: 'teammate' }],
+          dismissTeammate: async (agent, name) => {
+            teamDismissals.push([agent, name])
+            return { name, role: 'teammate' }
+          },
         }
       }
       if (name === 'sessions') return sessions
@@ -109,6 +120,7 @@ function makeCtx(home, options = {}) {
     _registered: registered,
     _projRows: projRows,
     _drainCalls: drainCalls,
+    _teamDismissals: teamDismissals,
     _parentAgent: parentAgent,
     _routes: routes,
   }
@@ -144,16 +156,22 @@ test('apply registers delete_subagent/release_subagent/list_subagents and tool e
     agent: ctx._parentAgent,
     signal: new AbortController().signal,
   }
+  // Deleted catalog children are hidden unless the caller asks for them.
   const list = await defs.get('list_subagents').execute({}, exec)
-  assert.equal(list.length, 10)
-  assert.equal(list.find((entry) => entry.id === ids[0]).present, true)
-  assert.equal(list.find((entry) => entry.id === ids[1]).present, false)
+  assert.deepEqual(list.map((entry) => entry.id), [ids[0]])
+  assert.equal(list[0].present, true)
+  const all = await defs.get('list_subagents').execute({ include_absent: true }, exec)
+  assert.equal(all.length, 10)
+  assert.equal(all.find((entry) => entry.id === ids[1]).present, false)
 
   const result = await defs.get('delete_subagent').execute({ subagent_id: ids[0], recursive: false }, exec)
   assert.deepEqual(result.deleted, [ids[0]])
   assert.deepEqual(result.already_absent, [])
   assert.equal(fs.existsSync(dir), false)
   assert.equal(ctx._projRows.has(ids[0]), false)
+  // A Team member is dismissed from the durable roster so the Team UI drops it.
+  assert.equal(result.results[0].dismissed, true)
+  assert.deepEqual(ctx._teamDismissals, [[ctx._parentAgent, 'fixture-teammate']])
 
   // The official lifecycle seam is exercised so web clients receive
   // api-session/added + api-session/removed frames and can refresh.
@@ -173,6 +191,9 @@ test('delete_subagent reports an already-absent catalog child instead of failing
   const result = await ctx._registered.get('delete_subagent').execute({ subagent_id: ids[3], recursive: false }, exec)
   assert.deepEqual(result.deleted, [])
   assert.deepEqual(result.already_absent, [ids[3]])
+  // Not a roster member: nothing to dismiss.
+  assert.equal(result.results[0].dismissed, false)
+  assert.deepEqual(ctx._teamDismissals, [])
   // Nothing was removed, so no refresh marker is published.
   assert.equal(ctx.get('sessions')._markerCalls.length, 0)
 })
@@ -202,14 +223,14 @@ test('list_subagents surfaces an unreadable child catalog branch', async (t) => 
   t.after(() => cleanup())
 
   const exec = { agent: ctx._parentAgent, signal: new AbortController().signal }
-  const listed = await ctx._registered.get('list_subagents').execute({}, exec)
+  const listed = await ctx._registered.get('list_subagents').execute({ include_absent: true }, exec)
   assert.equal(listed.length, 2)
   const broken = listed.find((entry) => entry.id === ids[1])
   assert.equal(broken.unreadable, 'corrupt')
   assert.equal(broken.activity, 'inactive')
 
   // A diagnostic branch is still a deletable target.
-  const targets = await ctx._registered.get('list_subagents').execute({ mode: 'unknown' }, exec)
+  const targets = await ctx._registered.get('list_subagents').execute({ mode: 'unknown', include_absent: true }, exec)
   assert.deepEqual(targets.map((entry) => entry.id), [ids[1]])
 })
 

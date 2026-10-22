@@ -26,6 +26,8 @@ export interface DeleteSessionResult {
   deleted: boolean
   /** True when nothing was left to remove (already deleted / never stored). */
   alreadyAbsent: boolean
+  /** True when the target was dismissed from the caller's durable Team roster. */
+  dismissed: boolean
   stopped: boolean
   /** True when the official child-Activation release seam handled the target. */
   drained: boolean
@@ -42,6 +44,8 @@ export interface DeleteSessionOptions {
   missingOk?: boolean
   /** Exact live direct parent Agent authorizing the child release. */
   parentAgent?: unknown
+  /** Live Agent authorizing a Team-roster dismissal; must be the Team Lead. */
+  callerAgent?: unknown
 }
 
 export interface ReleaseSessionResult {

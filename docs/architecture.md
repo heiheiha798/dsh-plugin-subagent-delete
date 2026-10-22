@@ -51,6 +51,12 @@ not retractable without rewriting a committed Session log, which DSH forbids.
 The header catalog dropdown can therefore keep showing a historical row for a
 deleted child.
 
+Team membership is a separate durable fact in the same Lead Session log, but it
+does have an official terminal state: `ctx.agentTeams.dismissTeammate` appends a
+`team/member` fact with phase `dismissed`, and the Team projection drops
+dismissed members. `deleteSessionCore` calls it (Lead callers only) before
+removing the Session, so the Team panel no longer lists the deleted teammate.
+
 ## Key field mapping
 
 | Wire frame (`api-session/added`) | Public list snapshot |
