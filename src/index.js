@@ -592,6 +592,30 @@ async function emitRemovalMarker(ctx, parentSessionId) {
  * @param options.parentAgent - exact live direct parent Agent authorizing the release.
  * @param options.callerAgent - live Agent authorizing a Team-roster dismissal (must be the Lead).
  */
+/**
+ * Retire a deleted child's append-only catalog row on its live parent.
+ * The parent catalog is durable creation history; the v3 `removed` tombstone
+ * keeps the row out of the published catalog (sidebar / lineage dropdown).
+ * @param ctx - plugin context.
+ * @param parentSessionId - durable parent whose catalog row is retired.
+ * @param childId - deleted child identity.
+ */
+function retireCatalogRow(ctx, parentSessionId, childId) {
+  const sessions = ctx.get('sessions')
+  if (!sessions || typeof sessions.get !== 'function') return false
+  const parent = sessions.get(parentSessionId)
+  if (parent === undefined || parent === null || typeof parent.append !== 'function') return false
+  try {
+    parent.append('subagent/catalog', {
+      version: 3, childId, childCreatedAt: Date.now(), mode: 'removed',
+    })
+    if (typeof sessions.flush === 'function') void sessions.flush(parent)
+    return true
+  } catch {
+    return false
+  }
+}
+
 async function deleteSessionCore(ctx, sessionId, parentSessionId, options = {}) {
   const { missingOk = false, parentAgent, callerAgent } = options
   if (!SESSION_ID_RE.test(sessionId)) {
@@ -623,6 +647,11 @@ async function deleteSessionCore(ctx, sessionId, parentSessionId, options = {}) 
     throw new DeleteError(`session files could not be fully removed: ${remainingDirs.join(', ')}`, 500, 'files-not-removed')
   }
 
+  // Retire the parent's durable catalog row even when the child session was
+  // already deleted without a tombstone (re-running delete cleans old rows).
+  const retired = parentSessionId === undefined
+    ? false
+    : retireCatalogRow(ctx, parentSessionId, sessionId)
   const workspaceStorage = await stripStorageDomains(ctx, sessionId, { workspace: true })
   const dirRemoved = firstDirRemoved || secondDirRemoved
   const projRemoved = projStorage.projRemoved || workspaceStorage.projRemoved
@@ -646,6 +675,7 @@ async function deleteSessionCore(ctx, sessionId, parentSessionId, options = {}) 
     deleted: removedAnything,
     alreadyAbsent: !removedAnything,
     dismissed,
+    retired,
     stopped,
     drained,
     detached,
