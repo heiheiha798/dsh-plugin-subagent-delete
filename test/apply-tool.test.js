@@ -172,6 +172,9 @@ test('apply registers delete_subagent/release_subagent/list_subagents and tool e
   // A Team member is dismissed from the durable roster so the Team UI drops it.
   assert.equal(result.results[0].dismissed, true)
   assert.deepEqual(ctx._teamDismissals, [[ctx._parentAgent, 'fixture-teammate']])
+  // This fake services only the legacy dismiss seam: no retireMember, so the
+  // optional post-delete retirement is skipped without failing the delete.
+  assert.equal(result.results[0].rosterRetired, false)
 
   // The official lifecycle seam is exercised so web clients receive
   // api-session/added + api-session/removed frames and can refresh.
@@ -283,3 +286,175 @@ test('delete_subagent tool refuses a foreign subagent', async (t) => {
     (error) => error.code === 'not-your-subagent',
   )
 })
+
+/** A real durable session directory for one fixture child. */
+function makeFixtureSession(home, id) {
+  const dir = path.join(home, 'sessions', '--home-user-project--', id)
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(path.join(dir, 'session.jsonl.zstd'), 'fake')
+  return dir
+}
+
+test('delete_subagent retires the deleted teammate through agentTeams.retireMember', async (t) => {
+  const home = tempHome(t)
+  const dir = makeFixtureSession(home, ids[0])
+
+  const retirements = []
+  const ctx = makeCtx(home, {
+    agentTeams: {
+      async retireMember(agent, request) {
+        retirements.push([agent, request, fs.existsSync(dir)])
+        return { retired: true }
+      },
+    },
+  })
+  const cleanup = await apply(ctx)
+  t.after(() => cleanup())
+
+  const exec = { agent: ctx._parentAgent, signal: new AbortController().signal }
+  const result = await ctx._registered.get('delete_subagent').execute({ subagent_id: ids[0], recursive: false }, exec)
+
+  assert.deepEqual(result.deleted, [ids[0]])
+  assert.equal(result.results[0].rosterRetired, true)
+  // Exactly one call, keyed by the deleted session id, made with the calling
+  // (Lead) Agent, and issued only after the durable session is already gone.
+  assert.deepEqual(retirements, [[ctx._parentAgent, { memberId: ids[0] }, false]])
+})
+
+test('a throwing retireMember never fails the delete or the tool result', async (t) => {
+  const home = tempHome(t)
+  const dir = makeFixtureSession(home, ids[0])
+
+  const warnings = []
+  const originalWarn = console.warn
+  console.warn = (...args) => { warnings.push(args) }
+  t.after(() => { console.warn = originalWarn })
+
+  const ctx = makeCtx(home, {
+    agentTeams: {
+      async retireMember() {
+        throw new Error('TEAM_INVALID_TARGET: not a Team member')
+      },
+    },
+  })
+  const cleanup = await apply(ctx)
+  t.after(() => cleanup())
+
+  const exec = { agent: ctx._parentAgent, signal: new AbortController().signal }
+  const result = await ctx._registered.get('delete_subagent').execute({ subagent_id: ids[0], recursive: false }, exec)
+
+  // The permanent delete and the UI refresh are unaffected; only the roster
+  // retirement is reported as not performed.
+  assert.deepEqual(result.deleted, [ids[0]])
+  assert.deepEqual(result.already_absent, [])
+  assert.equal(result.results[0].rosterRetired, false)
+  assert.equal(result.results[0].refreshPulse, true)
+  assert.equal(fs.existsSync(dir), false)
+  assert.equal(warnings.length, 1)
+  assert.match(String(warnings[0][0]), new RegExp(ids[0]))
+  assert.match(String(warnings[0][1]), /TEAM_INVALID_TARGET/)
+})
+
+test('delete_subagent works without a Team service (older dsh)', async (t) => {
+  const home = tempHome(t)
+  const dir = makeFixtureSession(home, ids[0])
+
+  const ctx = makeCtx(home, { agentTeams: null })
+  const cleanup = await apply(ctx)
+  t.after(() => cleanup())
+
+  const exec = { agent: ctx._parentAgent, signal: new AbortController().signal }
+  const result = await ctx._registered.get('delete_subagent').execute({ subagent_id: ids[0], recursive: false }, exec)
+
+  assert.deepEqual(result.deleted, [ids[0]])
+  assert.equal(result.results[0].dismissed, false)
+  assert.equal(result.results[0].rosterRetired, false)
+  assert.equal(fs.existsSync(dir), false)
+})
+
+test('delete_subagent does not retire a target that was already absent', async (t) => {
+  const home = tempHome(t)
+  const retirements = []
+  const ctx = makeCtx(home, {
+    agentTeams: {
+      async retireMember(agent, request) {
+        retirements.push([agent, request])
+        return { retired: true }
+      },
+    },
+  })
+  const cleanup = await apply(ctx)
+  t.after(() => cleanup())
+
+  const exec = { agent: ctx._parentAgent, signal: new AbortController().signal }
+  const result = await ctx._registered.get('delete_subagent').execute({ subagent_id: ids[3], recursive: false }, exec)
+
+  assert.deepEqual(result.deleted, [])
+  assert.deepEqual(result.already_absent, [ids[3]])
+  assert.equal(result.results[0].rosterRetired, false)
+  assert.deepEqual(retirements, [])
+})
+
+test('the HTTP delete route never retires the Team roster (no Agent credential)', async (t) => {
+  const home = tempHome(t)
+  const dir = makeFixtureSession(home, ids[0])
+
+  const retirements = []
+  const ctx = makeCtx(home, {
+    withHttp: true,
+    agentTeams: {
+      async retireMember(agent, request) {
+        retirements.push([agent, request])
+        return { retired: true }
+      },
+    },
+  })
+  const cleanup = await apply(ctx)
+  t.after(() => cleanup())
+
+  const requestBody = JSON.stringify({ parentSessionId: parent, subagentId: ids[0] })
+  const req = {
+    method: 'POST',
+    url: '/dsh-plugin-subagent-delete/delete',
+    on(event, callback) {
+      if (event === 'data') callback(requestBody)
+      else if (event === 'end') callback()
+      return req
+    },
+  }
+  let status
+  let payload
+  const res = {
+    writeHead(code) { status = code },
+    end(body) { payload = JSON.parse(body) },
+  }
+  await ctx._routes[1].handler(req, res)
+
+  assert.equal(status, 200)
+  assert.deepEqual(payload.deleted, [ids[0]])
+  assert.equal(payload.results[0].rosterRetired, false)
+  assert.deepEqual(retirements, [])
+  assert.equal(fs.existsSync(dir), false)
+})
+
+test('release_subagent never touches the Team roster', async (t) => {
+  const home = tempHome(t)
+  const retirements = []
+  const ctx = makeCtx(home, {
+    agentTeams: {
+      async retireMember(agent, request) {
+        retirements.push([agent, request])
+        return { retired: true }
+      },
+    },
+  })
+  const cleanup = await apply(ctx)
+  t.after(() => cleanup())
+
+  const exec = { agent: ctx._parentAgent, signal: new AbortController().signal }
+  const result = await ctx._registered.get('release_subagent').execute({ subagent_id: ids[2], recursive: false }, exec)
+
+  assert.deepEqual(result.released, [ids[2]])
+  assert.deepEqual(retirements, [])
+})
+

@@ -24,7 +24,10 @@
 //     composition exposes;
 //   * a permanent delete publishes a transient child marker through the
 //     official session lifecycle (prepare -> enter -> announce -> detach) so
-//     open web clients are told to refresh their session list and projections.
+//     open web clients are told to refresh their session list and projections;
+//   * after a successful delete the tool path retires the target from the
+//     caller's Team roster through `agentTeams.retireMember` when that seam is
+//     composed (older dsh: `dismissTeammate`, or silently skipped).
 //
 // Safety: a tool call may only target a descendant of the calling agent's own
 // session. The HTTP route requires the same explicit parentSessionId.
@@ -338,6 +341,40 @@ async function dismissTeamMember(ctx, callerAgent, sessionId) {
 }
 
 /**
+ * Retire one permanently deleted target from the caller's durable Team roster.
+ *
+ * The Team roster is a durable Lead-side fact, so deleting the child Session
+ * alone leaves the member row behind. Newer dsh exposes
+ * `agentTeams.retireMember(caller, { memberId })`, which appends the terminal
+ * `retired` roster fact for an already-deleted Session and is idempotent; the
+ * older `dismissTeammate` seam above only covers a still-resident member and
+ * stays as the compatibility path.
+ *
+ * Best-effort by contract: the target may be an ordinary (non-Team) subagent,
+ * the caller may not be the Lead, or the roster may already have dropped the
+ * member — none of that may turn a successful delete into a failure. A missing
+ * service or method (old dsh) is skipped silently.
+ *
+ * @returns {Promise<boolean>} true when the Team service reported a retirement.
+ */
+async function retireTeamMember(ctx, callerAgent, sessionId) {
+  if (!callerAgent) return false
+  const teams = ctx.get('agentTeams')
+  if (!teams || typeof teams.retireMember !== 'function') return false
+  try {
+    const result = await teams.retireMember(callerAgent, { memberId: sessionId })
+    return result?.retired === true
+  } catch (error) {
+    // The Session is already gone; roster retirement is best-effort cleanup.
+    console.warn(
+      `[dsh-plugin-subagent-delete] Team roster retirement skipped for ${sessionId}:`,
+      error?.message ?? error,
+    )
+    return false
+  }
+}
+
+/**
  * Drop a still-live session from the session store so host list/query stop
  * returning it.
  *
@@ -591,6 +628,7 @@ async function emitRemovalMarker(ctx, parentSessionId) {
  * @param options.missingOk - report an already-absent target instead of failing.
  * @param options.parentAgent - exact live direct parent Agent authorizing the release.
  * @param options.callerAgent - live Agent authorizing a Team-roster dismissal (must be the Lead).
+ * @param options.retireRoster - retire the deleted target from the caller's Team roster (tool path only).
  */
 /**
  * Retire a deleted child's append-only catalog row on its live parent.
@@ -617,7 +655,7 @@ function retireCatalogRow(ctx, parentSessionId, childId) {
 }
 
 async function deleteSessionCore(ctx, sessionId, parentSessionId, options = {}) {
-  const { missingOk = false, parentAgent, callerAgent } = options
+  const { missingOk = false, parentAgent, callerAgent, retireRoster = false } = options
   if (!SESSION_ID_RE.test(sessionId)) {
     throw new DeleteError(`invalid session id: ${sessionId}`, 400, 'invalid-session-id')
   }
@@ -670,12 +708,21 @@ async function deleteSessionCore(ctx, sessionId, parentSessionId, options = {}) 
     refreshPulse = await emitRemovalMarker(ctx, parentSessionId)
   }
 
+  // A teammate's roster row is a Lead-side durable fact, so only the tool path
+  // (which carries the calling Agent) retires it, and only once the permanent
+  // delete above has actually removed the Session. The HTTP route has no Agent
+  // credential and never requests this.
+  const rosterRetired = retireRoster && removedAnything
+    ? await retireTeamMember(ctx, callerAgent, sessionId)
+    : false
+
   return {
     sessionId,
     deleted: removedAnything,
     alreadyAbsent: !removedAnything,
     dismissed,
     retired,
+    rosterRetired,
     stopped,
     drained,
     detached,
@@ -912,6 +959,7 @@ function apply(ctx) {
           missingOk: true,
           parentAgent: parentAgentFor(ctx, entry.parentId, exec.agent),
           callerAgent: exec.agent,
+          retireRoster: true,
         }))
       }
       return {

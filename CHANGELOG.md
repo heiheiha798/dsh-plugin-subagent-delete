@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `delete_subagent` now also retires a permanently deleted teammate from the
+  caller's durable Team roster through
+  `ctx.agentTeams.retireMember(caller, { memberId })` (the tool path passes the
+  calling Agent). The roster row is a durable Lead-side fact, so the `retired`
+  terminal fact is what removes it from the Team panel after the child Session
+  is gone. The call is made only once the permanent delete actually removed the
+  target, is skipped silently when the composition mounts no Team service or
+  the method (older dsh), and a rejected retirement — e.g. the target is an
+  ordinary non-Team subagent — is caught and only logged, so it never changes
+  the delete result or the HTTP response. Each deleted row reports
+  `rosterRetired`; the HTTP delete route has no Agent credential and never
+  attempts a retirement. The legacy `dismissTeammate` dismissal stays for
+  compositions that expose only that seam.
+
 ## 0.2.3 — 2026-10-22
 
 ### Fixed

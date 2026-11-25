@@ -57,20 +57,24 @@ delete_subagent({ subagent_id: "<id>", recursive: true })
 
 1. 校验目标是调用代理会话的后代（后代发现使用官方 `ctx.subagents.listDescendants`，
    失败时回退到持久化 header 的血缘遍历）；
-2. 若目标是 Team 成员且调用方是 Team Lead，先通过官方
-   `ctx.agentTeams.dismissTeammate` 把它从持久化花名册中移除，Team 面板才会真正
-   不再列出该成员；
+2. 若目标是 Team 成员且调用方是 Team Lead，保留旧 dsh 兼容路径：组合中仍有
+   `ctx.agentTeams.dismissTeammate` 时先把它从持久化花名册中移除；
 3. 停止存活代理 / 通过官方 `ctx.subagents.drainChildren(parent, childIds)` 释放驻留的
    子 Activation（同时把子会话从 live store 中解绑）；
 4. 如仍存活，则从 `ctx.sessions` flush 并 detach 该会话；
 5. 删除磁盘上的会话日志目录（两种 uuid 写法都会处理）；
 6. 删除 `session_projcache` 行；
-7. 从 workspace 记账和归档集合中移除该 id。
+7. 从 workspace 记账和归档集合中移除该 id；
+8. 永久删除成功后，若组合暴露 `ctx.agentTeams.retireMember(caller, { memberId })`，
+   再通过它把该成员从持久化 Team 花名册中退役，Team 面板才会真正不再列出该成员。
 
 没有传 `recursive: true` 时，如果目标仍有后代，会以 `has-descendants` 拒绝。
 删除按子节点优先执行，且是永久性的。若目标的持久化会话已不存在，会返回
 `already_absent` 而不是报错，因此递归删除不会中途失败。每条删除结果都带
-`dismissed`：目标不是花名册成员、调用方不是 Lead、或未组合 Team 服务时为 `false`。
+`dismissed`（旧的删除前 dismiss）与 `rosterRetired`（删除后的退役）：目标不是花名册
+成员、调用方不是 Lead、或未组合对应 Team 服务时为 `false`。退役失败（例如目标是普通
+非 Team 子代理）会被捕获并仅记日志，不影响删除结果；HTTP 删除路由没有 Agent 凭证，
+不会发起退役。
 
 ### `release_subagent`
 
@@ -94,7 +98,8 @@ Activation，但保留持久化记录。之后仍可用 `send_message` 恢复。
 列表会自动更新。marker 的 `_no-cwd` 文件会在 detach 后清扫，不留残留。
 
 Team 会话还会把该成员从 Team 面板中移除：成员身份是持久化的 `team/member` 事实，
-`delete_subagent` 会先通过官方的 Lead 专属 dismiss 终止它，再删除会话。
+`delete_subagent` 会在删除会话后通过官方 Lead 专属的 `retireMember` 终止它（旧 dsh
+则使用删除前的 `dismissTeammate`）。
 
 一个仍然存在的限制：父会话的 `subagent/catalog` 事实是只追加的持久历史，所以被删除
 的子代理可能仍会作为**历史条目**出现在父会话头部的子代理目录下拉框中，直到父会话日志

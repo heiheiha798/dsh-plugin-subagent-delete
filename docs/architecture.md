@@ -52,10 +52,16 @@ The header catalog dropdown can therefore keep showing a historical row for a
 deleted child.
 
 Team membership is a separate durable fact in the same Lead Session log, but it
-does have an official terminal state: `ctx.agentTeams.dismissTeammate` appends a
-`team/member` fact with phase `dismissed`, and the Team projection drops
-dismissed members. `deleteSessionCore` calls it (Lead callers only) before
-removing the Session, so the Team panel no longer lists the deleted teammate.
+does have an official terminal state. Compositions that expose
+`ctx.agentTeams.dismissTeammate` can dismiss a still-resident member (phase
+`dismissed`) before the Session goes away; `deleteSessionCore` keeps that call
+for them (Lead callers only). Newer dsh exposes the post-delete form,
+`ctx.agentTeams.retireMember(caller, { memberId })`, which appends the terminal
+`retired` roster fact for an already-deleted Session; the `delete_subagent` tool
+path calls it after a successful permanent delete and reports `rosterRetired`.
+The HTTP route carries no Agent credential and never retires. Either way the
+Team projection drops the member, so the Team panel no longer lists the deleted
+teammate; a missing service or method is skipped silently.
 
 ## Key field mapping
 

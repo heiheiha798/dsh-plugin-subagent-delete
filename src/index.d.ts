@@ -28,6 +28,13 @@ export interface DeleteSessionResult {
   alreadyAbsent: boolean
   /** True when the target was dismissed from the caller's durable Team roster. */
   dismissed: boolean
+  /**
+   * True when the target was retired from the caller's durable Team roster
+   * through `ctx.agentTeams.retireMember` after the permanent delete.
+   * Always false on the HTTP route (no Agent credential) and when the
+   * composition mounts no Team service.
+   */
+  rosterRetired: boolean
   stopped: boolean
   /** True when the official child-Activation release seam handled the target. */
   drained: boolean
@@ -46,6 +53,12 @@ export interface DeleteSessionOptions {
   parentAgent?: unknown
   /** Live Agent authorizing a Team-roster dismissal; must be the Team Lead. */
   callerAgent?: unknown
+  /**
+   * Retire the target from the caller's Team roster after a successful
+   * permanent delete. Only the tool path sets this (it carries the calling
+   * Agent); the HTTP route leaves it off.
+   */
+  retireRoster?: boolean
 }
 
 export interface ReleaseSessionResult {

@@ -58,12 +58,11 @@ ctx.provide('sessions', {
   },
   announce(session) { markerCalls.push(['announce', session.id]) },
 })
-const teamDismissals = []
+const teamRetirements = []
 ctx.provide('agentTeams', {
-  listMembers: () => [{ id: child, name: 'probe teammate', role: 'teammate' }],
-  async dismissTeammate(agent, name) {
-    teamDismissals.push([agent, name])
-    return { name, role: 'teammate' }
+  async retireMember(agent, request) {
+    teamRetirements.push([agent, request])
+    return { retired: true }
   },
 })
 ctx.provide('storageDomain', {
@@ -123,8 +122,8 @@ const deleted = await ctx.tools.execute({
 })
 assert.equal(deleted.isError, false)
 assert.deepEqual(JSON.parse(deleted.content[0].text).deleted, [child])
-assert.equal(JSON.parse(deleted.content[0].text).results[0].dismissed, true, 'Team roster dismissal invoked')
-assert.deepEqual(teamDismissals, [[parentAgent, 'probe teammate']])
+assert.equal(JSON.parse(deleted.content[0].text).results[0].rosterRetired, true, 'Team roster retirement invoked')
+assert.deepEqual(teamRetirements, [[parentAgent, { memberId: child }]])
 assert.equal(fs.existsSync(childDir), false, 'durable session directory removed')
 assert.equal(projRows.has(child), false, 'projection cache row removed')
 assert.deepEqual(drainCalls[0], [parentAgent, [child]], 'release used the exact live parent')

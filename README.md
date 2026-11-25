@@ -61,23 +61,32 @@ Permanently removes the subagent:
 1. verifies the target is a descendant of the calling agent's session
    (descendant discovery uses the official `ctx.subagents.listDescendants`,
    falling back to a persisted-header lineage walk);
-2. when the target is a Team member and the caller is the Team Lead, dismisses
-   it from the durable Team roster through `ctx.agentTeams.dismissTeammate`, so
-   the Team panel stops listing the teammate;
+2. when the target is a Team member and the caller is the Team Lead, keeps the
+   pre-0.2.1 compatibility path: dismisses it from the durable Team roster
+   through `ctx.agentTeams.dismissTeammate` when the composition exposes that
+   seam;
 3. stops the live agent / releases a resident child Activation through the
    official `ctx.subagents.drainChildren(parent, childIds)` seam, which also
    detaches the child Session from the live store;
 4. flushes and (if still live) detaches the session from `ctx.sessions`;
 5. removes the on-disk session log directory (both uuid spellings);
 6. removes the `session_projcache` row;
-7. removes the id from workspace accounting and the archive set.
+7. removes the id from workspace accounting and the archive set;
+8. after the permanent delete succeeded, retires the target from the durable
+   Team roster through `ctx.agentTeams.retireMember(caller, { memberId })` when
+   the composition exposes that seam, so the Team panel stops listing the
+   teammate.
 
 Without `recursive: true` a target that still has descendants is refused with
 `has-descendants`. Deletion is child-first and permanent. A target whose durable
 session is already gone reports `already_absent` instead of `not-found`, so a
-subtree delete never aborts half-way. Each deleted row reports `dismissed`,
-which stays `false` when the target is not a roster member, the caller is not the
-Lead, or the composition mounts no Team service.
+subtree delete never aborts half-way. Each deleted row reports `dismissed`
+(legacy pre-delete dismissal) and `rosterRetired` (post-delete retirement); each
+stays `false` when the target is not a roster member, the caller is not the
+Lead, or the composition mounts no matching Team service. A rejected retirement
+(e.g. an ordinary non-Team subagent) is caught and only logged: it never changes
+the delete result, and the HTTP delete route has no Agent credential so it never
+attempts a retirement.
 
 ### `release_subagent`
 
@@ -107,7 +116,8 @@ therefore drop the deleted subagent without a manual page reload. The marker's
 
 Team sessions additionally lose the teammate from the Team panel: a teammate is
 a durable `team/member` fact, and `delete_subagent` terminates it through the
-official Lead-only dismissal before removing the Session.
+official Lead-only `retireMember` seam after removing the Session (older dsh:
+the `dismissTeammate` dismissal before it).
 
 One honest limit remains: the parent Session's `subagent/catalog` facts are
 append-only durable history, so a deleted child can still appear as a
